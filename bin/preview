@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""On-demand previews: one state file, one transition lock, direct dev processes."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+from pathlib import Path
+import signal
+import shutil
+import tempfile
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from worktree_ports import ADMIN_PORT, OAUTH_PORT, RESERVED_PORTS, derive_port
+
+GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
+OAUTH_REPOS = frozenset({"healthtree/one", "healthtree/next"})
+ADMIN_STATE_SUBDIR = os.path.join(".preview", "admin")
+LOCAL_ADMIN_BOOTSTRAP_PATH = "/__samson-local-admin-bootstrap"
+GUIDE_PREVIEW_PROXY_ENV = "GUIDE_PREVIEW_PROXY_TARGET"
+_ALGOLIA_ENV_KEYS = ("VITE_ALGOLIA_APP_ID", "VITE_ALGOLIA_API_KEY")
+_UNHANDLED_REJECTIONS_WARN = "--unhandled-rejections=warn"
+LOG_TAIL_LINES = 8
+READY_TIMEOUT = 60
+_DEV_SERVER_COMMANDS = frozenset({"node", "nodejs", "npm", "npx", "yarn", "pnpm", "bun", "vite", "next", "next-server", "next-dev"})
+
+def admin_component_path(worktree_path):
+    """Synthetic admin component state for one worktree; never source code."""
+    return os.path.join(os.path.realpath(worktree_path), ADMIN_STATE_SUBDIR)
+
+
+def is_admin_app(path):
+    """True for the synthetic <worktree>/.preview/admin component."""
+    path = os.path.realpath(path)
+    return (os.path.basename(path) == "admin"
+            and os.path.basename(os.path.dirname(path)) == ".preview")
+
+
+def _runtime_root(path):
+    """Directory from which this component's dev process must run."""
+    path = os.path.realpath(path)
+    return os.path.dirname(os.path.dirname(path)) if is_admin_app(path) else path
+
+
+def _preview_dir(path):
+    path = os.path.realpath(path)
+    return path if is_admin_app(path) else os.path.join(path, ".preview")
+
+
+def worktree_revision(path):
+    """HEAD of this component's owning worktree, or '' if Git cannot answer."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", _runtime_root(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def dev_command(path):
+    """This component's dev script, or None when it is not previewable."""
+    script = "admin:dev" if is_admin_app(path) else "dev"
+    try:
+        with open(os.path.join(_runtime_root(path), "package.json")) as f:
+            pkg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return pkg.get("scripts", {}).get(script) or None
+
+
+def _host_platform():
+    """npm optional dependency name for the machine running the board."""
+    system = sys.platform.lower()
+    system = "darwin" if system.startswith("darwin") else system
+    system = "win32" if system.startswith("win") else system
+    machine = os.uname().machine.lower()
+    machine = "arm64" if machine in ("arm64", "aarch64") else machine
+    machine = "x64" if machine in ("x86_64", "amd64") else machine
+    return f"{system}-{machine}"
+
+
+def host_dependency_health(path):
+    """Verify host-native esbuild without omitting optional dependencies."""
+    runtime_root = _runtime_root(path)
+    if not os.path.isfile(os.path.join(runtime_root, "package-lock.json")):
+        return {"ok": True, "reason": "no package lock"}
+    modules = os.path.join(runtime_root, "node_modules")
+    repair = f"run npm ci in {runtime_root}"
+    if not os.path.isdir(modules) or os.path.islink(modules):
+        return {"ok": False, "error": f"host node_modules missing or linked at {modules}",
+                "repair": repair}
+    package_path = os.path.join(modules, "esbuild", "package.json")
+    try:
+        with open(package_path) as f:
+            js_version = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        return {"ok": False, "error": f"host esbuild package missing at {package_path}",
+                "repair": repair}
+    platform = _host_platform()
+    binary = os.path.join(modules, "@esbuild", platform, "bin", "esbuild")
+    if not os.path.isfile(binary):
+        return {"ok": False,
+                "error": f"host optional package @esbuild/{platform} missing ({binary})",
+                "repair": repair}
+    command = os.path.join(modules, ".bin", "esbuild")
+    if not os.path.exists(command):
+        command = binary
+    try:
+        result = subprocess.run([command, "--version"], capture_output=True,
+                                text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"host esbuild failed: {exc}",
+                "repair": repair, "binary": binary}
+    actual = (result.stdout or "").strip()
+    if result.returncode != 0:
+        detail = (result.stderr or actual or f"exit {result.returncode}").strip()
+        return {"ok": False, "error": f"host esbuild failed: {detail}",
+                "repair": repair, "binary": binary}
+    if actual != js_version:
+        return {"ok": False,
+                "error": f"host esbuild JS {js_version} != binary {actual}",
+                "repair": repair, "binary": binary}
+    return {"ok": True, "binary": binary, "version": actual}
+
+
+def _origin_url(path):
+    """This worktree's origin remote URL, or '' if it has none. The subprocess
+    boundary -- stubbed in tests."""
+    r = subprocess.run(
+        ["git", "-C", _runtime_root(path), "remote", "get-url", "origin"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+def is_oauth_bound(path):
+    """True if this worktree belongs to an OAUTH_REPOS app, and so must serve
+    on the shared OAUTH_PORT instead of its own derived port.
+
+    A linked worktree reports the same origin as its primary checkout, so every
+    worktree of one/next answers True -- which is the point: they take turns on
+    the one port Google will accept. Match is anchored on the '/' or ':' before
+    the owner, so a lookalike remote (notheathtree/one) can never pass.
+    """
+    url = _origin_url(path).strip().lower().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-len(".git")]
+    if not url:
+        return False
+    return any(url.endswith("/" + name) or url.endswith(":" + name)
+               for name in OAUTH_REPOS)
+
+
+def _apply_dev_node_options(env):
+    """Append --unhandled-rejections=warn without clobbering existing NODE_OPTIONS."""
+    existing = (env.get("NODE_OPTIONS") or "").strip()
+    if _UNHANDLED_REJECTIONS_WARN in existing:
+        return env
+    env["NODE_OPTIONS"] = (
+        f"{existing} {_UNHANDLED_REJECTIONS_WARN}".strip() if existing
+        else _UNHANDLED_REJECTIONS_WARN
+    )
+    return env
+
+
+def _parse_dotenv_keys(text, keys):
+    """Read selected KEY=VALUE pairs. dotenv-compatible enough for export,
+    quotes, and comments; ignores every other key on purpose."""
+    wanted = set(keys)
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if key not in wanted:
+            continue
+        out[key] = _dotenv_value(val)
+    return out
+
+
+def _dotenv_value(val):
+    """Unquote a dotenv value and drop an unquoted trailing comment."""
+    val = val.strip()
+    if not val:
+        return val
+    if val[0] in ("'", '"'):
+        q = val[0]
+        end = val.find(q, 1)
+        return val[1:end] if end != -1 else val[1:]
+    cut = val.find(" #")
+    if cut == -1:
+        cut = val.find("\t#")
+    if cut != -1:
+        val = val[:cut].rstrip()
+    return val
+
+
+def _primary_checkout(path):
+    """Owning primary checkout via git-common-dir -- same mechanism as
+    worktree-setup's local-env source. None when path is not a worktree."""
+    root = _runtime_root(path)
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--path-format=absolute",
+             "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    common = (r.stdout or "").strip().rstrip("/")
+    if r.returncode != 0 or not common:
+        return None
+    if os.path.basename(common) != ".git":
+        return None
+    return os.path.dirname(common)
+
+
+def _inject_admin_algolia(env, admin_path):
+    """Put only the root admin's Algolia keys into env; never copy its .env."""
+    env_path = os.path.join(_runtime_root(admin_path), ".env")
+    if not os.path.isfile(env_path):
+        primary = _primary_checkout(admin_path)
+        env_path = os.path.join(primary, ".env") if primary else ""
+        if not env_path or not os.path.isfile(env_path):
+            return
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeError):
+        return
+    for key, val in _parse_dotenv_keys(text, _ALGOLIA_ENV_KEYS).items():
+        env.setdefault(key, val)
+
+
+def _vite_cache_dir(path):
+    """Worktree-local Vite cache. Never node_modules/.vite: that follows a
+    symlink or APFS clone into another checkout's snapshot."""
+    return os.path.join(_preview_dir(path), "vite")
+
+
+def _vite_overlay_path(path):
+    return os.path.join(_preview_dir(path), "vite.config.mjs")
+
+
+def _write_vite_overlay(path, *, local_admin_bootstrap=False):
+    """Tiny Vite config that keeps the app's own config and pins root/cache.
+
+    Vite has no --cacheDir CLI flag (unknown options crash the process).
+    --config replaces the app config unless we merge it back in. A paired
+    local-admin launch also gets one Vite-only route that removes the
+    localhost session collision before the admin SSR layout sees it.
+    """
+    component_path = os.path.realpath(path)
+    root = _runtime_root(component_path)
+    overlay = _vite_overlay_path(component_path)
+    bootstrap = ""
+    plugins = ""
+    if local_admin_bootstrap:
+        bootstrap = (
+            f"const localAdminBootstrapPath = {json.dumps(LOCAL_ADMIN_BOOTSTRAP_PATH)};\n"
+            "const localAdminBootstrapPlugin = {\n"
+            "  name: 'samson-local-admin-bootstrap',\n"
+            "  configureServer(server) {\n"
+            "    server.middlewares.use((req, res, next) => {\n"
+            "      if ((req.url || '').split('?', 1)[0] !== localAdminBootstrapPath) return next();\n"
+            "      res.statusCode = 302;\n"
+            "      res.setHeader('Cache-Control', 'no-store');\n"
+            "      res.setHeader('Set-Cookie', '__session=; Path=/; Max-Age=0; SameSite=Lax');\n"
+            "      res.setHeader('Location', '/');\n"
+            "      res.end();\n"
+            "    });\n"
+            "  },\n"
+            "};\n"
+        )
+        plugins = ", plugins: [localAdminBootstrapPlugin]"
+    os.makedirs(os.path.dirname(overlay), exist_ok=True)
+    with open(overlay, "w") as f:
+        f.write(
+            "import { loadConfigFromFile, mergeConfig } from 'vite';\n"
+            f"const root = {json.dumps(root)};\n"
+            f"const cacheDir = {json.dumps(_vite_cache_dir(component_path))};\n"
+            f"{bootstrap}"
+            "export default async function (env) {\n"
+            "  const loaded = await loadConfigFromFile(env, undefined, root);\n"
+            f"  return mergeConfig(loaded?.config ?? {{}}, {{ root, cacheDir{plugins} }});\n"
+            "}\n"
+        )
+    return overlay
+
+
+def _break_foreign_svelte_kit(path):
+    """Unlink .svelte-kit only when it resolves outside this worktree.
+
+    An in-tree link is a valid local layout. A link to another checkout
+    (worktree-doctor) pins generated files to that other snapshot.
+    """
+    root = _runtime_root(path)
+    svelte = os.path.join(root, ".svelte-kit")
+    if not os.path.islink(svelte):
+        return
+    target = os.path.realpath(svelte)
+    if target == root or target.startswith(root + os.sep):
+        return
+    os.unlink(svelte)
+
+
+def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=None):
+    env = dict(os.environ)
+    if path:
+        # Match local development: primary checkout defaults, then this tree's
+        # own values. Nothing is copied into the worktree or sent off-machine.
+        defaults = {}
+        primary = _primary_checkout(path)
+        for root in dict.fromkeys(filter(None, (primary, _runtime_root(path)))):
+            for name in ('.env', '.env.development', '.env.local', '.env.development.local'):
+                file = Path(root) / name
+                if file.is_file():
+                    text = file.read_text()
+                    keys = re.findall(r'^(?:export )?([A-Za-z_][A-Za-z_0-9]*)=', text, re.M)
+                    defaults.update(_parse_dotenv_keys(text, keys))
+        for key, value in defaults.items():
+            env.setdefault(key, value)
+    env["PORT"] = str(port)  # next's scripts/dev.js reads this directly
+    runtime_root = _runtime_root(path) if path else None
+    if runtime_root:
+        # Popen cwd= chdir's the child but leaves inherited $PWD (the board
+        # process was started from Sam's one primary). Tools that read PWD
+        # would then resolve that other checkout.
+        env["PWD"] = runtime_root
+    _apply_dev_node_options(env)
+    if port == ADMIN_PORT:
+        # Without this the admin proxies guide-preview grants to vite's default
+        # 5173, which is not where the main app runs, and the grant silently
+        # reaches nothing.
+        env.setdefault(GUIDE_PREVIEW_PROXY_ENV, f"http://localhost:{OAUTH_PORT}")
+        # Board serves One on OAUTH_PORT (6173), never vite's 5173. Force the
+        # impersonation handoff target so a stale root .env cannot send
+        # "Log in as user" at a server that is not running. process.env wins
+        # over loadEnv in the admin Vite config.
+        env["VITE_FRONTEND_URL"] = f"http://localhost:{OAUTH_PORT}"
+        if path:
+            _inject_admin_algolia(env, path)
+    argv = ["npm", "run", "admin:dev" if path and is_admin_app(path) else "dev"]
+    if "vite" in dev:
+        # vite itself ignores $PORT; needs the flag passed through npm's --
+        argv += ["--", "--port", str(port), "--strictPort"]
+        if runtime_root:
+            # `vite [root]` is positional; --root is not a CLI flag.
+            argv.append(runtime_root)
+        if vite_config:
+            argv += ["--config", vite_config]
+        if loopback_host:
+            # Bind loopback directly; no relay process.
+            argv += ["--host", loopback_host]
+    elif loopback_host:
+        # next dev and friends often honor HOST for the listen address.
+        env["HOST"] = loopback_host
+    return argv, env
+
+
+def _ensure_ignored(path):
+    """Add .preview/ to this repo's shared git exclude (once) so the
+    per-worktree state dir never shows up as untracked -- best effort, never
+    fatal to start()."""
+    root = _runtime_root(path)
+    r = subprocess.run(["git", "-C", root, "rev-parse", "--git-common-dir"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return
+    common = r.stdout.strip()
+    if not os.path.isabs(common):
+        common = os.path.join(root, common)
+    exclude_path = os.path.join(common, "info", "exclude")
+    try:
+        os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+        existing = ""
+        if os.path.exists(exclude_path):
+            with open(exclude_path) as f:
+                existing = f.read()
+        if ".preview/" not in existing.splitlines():
+            with open(exclude_path, "a") as f:
+                f.write("\n.preview/\n")
+    except OSError:
+        pass
+
+
+def _log_tail(path, max_lines=LOG_TAIL_LINES):
+    """Last non-empty lines of .preview/log -- the Firebase / node stack that
+    explains why the process died. Best-effort; empty string if missing."""
+    log_path = os.path.join(_preview_dir(path), "log")
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [ln.rstrip() for ln in data.splitlines() if ln.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _load_state():
+    try:
+        return json.loads((Path(GLOBAL_STATE_DIR) / 'servers.json').read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def _save_state(state):
+    directory = Path(GLOBAL_STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / 'servers.json.tmp'
+    with temporary.open('w') as stream:
+        json.dump(state, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(directory / 'servers.json')
+
+
+@contextlib.contextmanager
+def _transition():
+    directory = Path(GLOBAL_STATE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'transition.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield _load_state()
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _processes():
+    result = subprocess.run(
+        ['ps', '-axo', 'pid=,ppid=,pgid=,uid=,lstart=,stat=,comm='],
+        capture_output=True, text=True, timeout=5, check=True)
+    processes = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 10)
+        if len(fields) != 11 or fields[9].startswith('Z'):
+            continue
+        pid, parent, group, uid = map(int, fields[:4])
+        if uid == os.getuid():
+            processes[pid] = dict(pid=pid, parent=parent, group=group, uid=uid,
+                                  birth=' '.join(fields[4:9]), command=fields[10])
+    return processes
+
+
+def _matches(saved, current):
+    return bool(saved and current and all(saved.get(k) == current.get(k)
+                for k in ('pid', 'group', 'uid', 'birth')))
+
+
+def _members(record, processes):
+    anchors = record.get('members', []) + [record.get('process', {})]
+    if not any(_matches(p, processes.get(p.get('pid'))) for p in anchors):
+        return []
+    group = record['process']['group']
+    return [p for p in processes.values() if p['group'] == group]
+
+
+def _listeners(port):
+    result = subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'],
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f'Could not inspect port {port}.')
+    return {int(pid) for pid in result.stdout.split()}
+
+
+def _terminate(processes, *, owned_group=False):
+    """TERM, then KILL survivors, checking identity before each signal."""
+    if not processes:
+        return
+    known = {p['pid']: p for p in processes}
+    initial = _processes()
+    # Include children of an external Node listener, never its shell/parent.
+    while True:
+        children = {pid: p for pid, p in initial.items() if p['parent'] in known}
+        if children.keys() <= known.keys():
+            break
+        known.update(children)
+    groups = {p['group'] for p in processes} if owned_group else set()
+    for sig, seconds in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
+        current = _processes()
+        if any(_matches(p, current.get(pid)) for pid, p in known.items()):
+            known.update({pid: p for pid, p in current.items() if p['group'] in groups})
+        for pid, saved in list(known.items()):
+            # Re-read immediately before signaling; old PID files never authorize a kill.
+            if _matches(saved, _processes().get(pid)):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            current = _processes()
+            if not any(_matches(p, current.get(pid)) for pid, p in known.items()):
+                return
+            time.sleep(.1)
+    raise RuntimeError('A preview process did not exit after Stop.')
+
+
+def port_is_ready(port, vite=False):
+    # Vite's own client avoids compiling SSR and contacting Firebase just to
+    # check whether the dev server started. Browser navigation loads the page.
+    route = '/@vite/client' if vite else '/'
+    try:
+        with urllib.request.urlopen(f'http://localhost:{port}{route}', timeout=1) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as error:
+        return error.code < 500 and not vite
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def served_revision(path):
+    return _load_state().get(os.path.realpath(path), {}).get('revision', '')
+
+
+def status(path):
+    """Read only. Stop removes its record, so Stop cannot become a crash."""
+    path = os.path.realpath(path)
+    record = _load_state().get(path)
+    if not record:
+        return dict(running=False, crashed=False, port=None, pid=None)
+    members = _members(record, _processes()) if record.get('process') else []
+    listeners = _listeners(record['port']) if members else set()
+    running = bool(listeners) and listeners <= {p['pid'] for p in members}
+    result = dict(running=running, crashed=not running and not (members and record.get('starting')), port=record.get('port'),
+                  pid=record.get('process', {}).get('pid'))
+    if not running:
+        result.update(message=record.get('error') or 'The dev server exited.', log_tail=_log_tail(path))
+    return result
+
+
+def _stop(state, paths):
+    records = [(path, state.get(path)) for path in paths]
+    # Publish the intended stop before signaling. Polling cannot report a crash.
+    for path in paths:
+        state.pop(path, None)
+    _save_state(state)
+    errors = []
+    for path, record in records:
+        if not record or not record.get('process'):
+            continue
+        try:
+            _terminate(_members(record, _processes()), owned_group=True)
+        except Exception as error:
+            state[path] = dict(record, error=str(error))
+            errors.append(str(error))
+    _save_state(state)
+    if errors:
+        raise RuntimeError('; '.join(errors))
+
+
+def _port_holders(ports):
+    """Inspect every requested port before touching the current preview."""
+    holders = {}
+    for port in ports:
+        listeners = _listeners(port)
+        processes = _processes()
+        owners = [processes.get(pid) for pid in listeners]
+        if any(p is None or os.path.basename(p['command']).split()[0] not in _DEV_SERVER_COMMANDS
+               for p in owners):
+            raise RuntimeError(f'Port {port} is held by a process that is not a dev server.')
+        holders[port] = owners
+    return holders
+
+
+def _free_ports(state, ports, holders):
+    held = [path for path, record in state.items() if record.get('port') in ports]
+    _stop(state, held)
+    for port in ports:
+        _terminate(holders[port])
+        if _listeners(port):
+            raise RuntimeError(f'Port {port} is still occupied. Its owner may be restarting it.')
+
+
+def _launch(state, path, port):
+    dev = dev_command(path)
+    os.makedirs(_preview_dir(path), exist_ok=True)
+    _ensure_ignored(path)
+    _break_foreign_svelte_kit(path)
+    overlay = _write_vite_overlay(path, local_admin_bootstrap=is_admin_app(path)) if 'vite' in dev else None
+    argv, env = _build_argv_env(dev, port, loopback_host='localhost', path=path, vite_config=overlay)
+    with open(os.path.join(_preview_dir(path), 'log'), 'wb') as log:
+        child = subprocess.Popen(argv, cwd=_runtime_root(path), env=env, stdout=log,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+    processes = _processes()
+    members = [p for p in processes.values() if p['group'] == child.pid]
+    process = processes.get(child.pid) or next(iter(members), None)
+    threading.Thread(target=child.wait, daemon=True).start()
+    if not process:
+        raise RuntimeError('The dev command exited during startup.')
+    state[path] = dict(process=process, members=members, port=port, starting=True, revision=worktree_revision(path))
+    _save_state(state)
+
+
+def _wait_ready(state, path, deadline):
+    record = state[path]
+    while time.monotonic() < deadline:
+        members = _members(record, _processes())
+        if not members:
+            raise RuntimeError('The dev server exited during startup.')
+        if record['members'] != members:
+            record['members'] = members
+            _save_state(state)
+        listener_ids = _listeners(record['port'])
+        if listener_ids and listener_ids <= {p['pid'] for p in members}:
+            if port_is_ready(record['port'], vite='vite' in dev_command(path)):
+                record.pop('starting', None)
+                _save_state(state)
+                return
+        time.sleep(.25)
+    raise RuntimeError('The dev server did not start within 60 seconds.')
+
+
+def _result(state, paths, already=False):
+    components = [dict(ok=True, ready=True, port=state[p]['port'], already_running=already)
+                  for p in paths]
+    if len(paths) == 1:
+        return components[0]
+    admin, main = components
+    return dict(ok=True, ready=True, port=main['port'], admin_port=admin['port'],
+                main=main, admin=admin, already_running=already)
+
+
+def _prepare_dependencies(path):
+    """Prepare once on Start. APFS clones share disk blocks, not writable files."""
+    root = Path(_runtime_root(path))
+    modules = root / 'node_modules'
+    log_dir = Path(_preview_dir(path))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    health = host_dependency_health(path)
+    if modules.is_dir() and health['ok']:
+        return
+    primary = _primary_checkout(path)
+    donor = Path(primary) if primary else None
+    # Only reuse a working install from this same repo with the exact lockfile.
+    locks = ('package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb')
+    lock = next((name for name in locks if (root / name).is_file()), None)
+    compatible = bool(donor and donor != root and lock and (donor / lock).is_file()
+                      and (root / lock).read_bytes() == (donor / lock).read_bytes())
+    if compatible and (donor / 'node_modules').is_dir() and host_dependency_health(str(donor))['ok'] and sys.platform == 'darwin':
+        temporary = Path(tempfile.mkdtemp(prefix='.dependencies-', dir=log_dir))
+        try:
+            result = subprocess.run(['cp', '-cR', str(donor / 'node_modules'), str(temporary / 'node_modules')],
+                                    capture_output=True, timeout=120)
+            if result.returncode == 0:
+                if modules.is_symlink():
+                    modules.unlink()
+                elif modules.exists():
+                    shutil.rmtree(modules)
+                (temporary / 'node_modules').replace(modules)
+                if host_dependency_health(path)['ok']:
+                    return
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+    if modules.is_symlink():
+        modules.unlink()
+    if lock == 'pnpm-lock.yaml':
+        argv = ['pnpm', 'install', '--frozen-lockfile']
+    elif lock == 'yarn.lock':
+        argv = ['yarn', 'install']
+    elif lock in ('bun.lock', 'bun.lockb'):
+        argv = ['bun', 'install', '--frozen-lockfile']
+    else:
+        argv = ['npm', 'ci' if lock == 'package-lock.json' else 'install', '--no-audit', '--no-fund']
+    with (log_dir / 'log').open('wb') as log:
+        child = subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+        processes = _processes()
+        owned = [p for p in processes.values() if p['group'] == child.pid]
+        try:
+            if child.wait(timeout=600) != 0:
+                raise RuntimeError('Package setup failed. The setup log has the details.')
+        finally:
+            _terminate(owned, owned_group=True)
+            child.wait()
+    if not host_dependency_health(path)['ok']:
+        raise RuntimeError('Package setup did not finish correctly. Try Start again.')
+
+
+def _start(state, paths, *, restart=False):
+    for path in paths:
+        if not os.path.isdir(_runtime_root(path)) or not dev_command(path):
+            raise RuntimeError(f'No dev script exists for {_runtime_root(path)}.')
+    _prepare_dependencies(paths[-1])
+    if not restart and all(state.get(p) and _members(state[p], _processes())
+                           and _listeners(state[p]['port']) <= {m['pid'] for m in _members(state[p], _processes())}
+                           and port_is_ready(state[p]['port'], vite='vite' in dev_command(p)) for p in paths):
+        return _result(state, paths, already=True)
+    pair = len(paths) == 2
+    ports = [ADMIN_PORT, OAUTH_PORT] if pair else [
+        ADMIN_PORT if is_admin_app(paths[0]) else OAUTH_PORT if is_oauth_bound(paths[0]) else derive_port(paths[0])]
+    if not pair and ports[0] not in RESERVED_PORTS:
+        while _listeners(ports[0]) and not any(r.get('port') == ports[0] for r in state.values()):
+            ports[0] += 1
+            while ports[0] in RESERVED_PORTS:
+                ports[0] += 1
+    holders = _port_holders(ports)
+    _stop(state, paths)
+    _free_ports(state, ports, holders)
+    deadline = time.monotonic() + READY_TIMEOUT
+    path = paths[0]
+    try:
+        for path, port in zip(paths, ports):
+            _launch(state, path, port)
+            _wait_ready(state, path, deadline)
+        return _result(state, paths)
+    except Exception as error:
+        tail = _log_tail(path)
+        _stop(state, paths)
+        state[path] = dict(port=ports[paths.index(path)], error=str(error))
+        _save_state(state)
+        return dict(ok=False, error='start_failed', message=str(error), log_tail=tail,
+                    component='admin' if is_admin_app(path) else 'main', port=state[path]['port'])
+
+
+def _operate(path, action, pair=False, expected_revision=None):
+    path = os.path.realpath(path)
+    paths = [admin_component_path(path), path] if pair else [path]
+    try:
+        with _transition() as state:
+            if action == 'stop':
+                _stop(state, paths)
+                return dict(ok=True, stopped=True)
+            if expected_revision is not None:
+                # A stale watcher must never take the slot back from Sam's new choice.
+                if (not all(state.get(p) and _members(state[p], _processes()) for p in paths)
+                        or worktree_revision(path) != expected_revision):
+                    return dict(ok=True, skipped=True)
+            return _start(state, paths, restart=action == 'restart')
+    except Exception as error:
+        return dict(ok=False, error='preview_failed', message=str(error), log_tail=_log_tail(path))
+
+
+def start(path, force=False):
+    return _operate(path, 'start')
+
+
+def stop(path):
+    return _operate(path, 'stop')
+
+
+def start_pair(path, force=False):
+    return _operate(path, 'start', pair=True)
+
+
+def stop_pair(path):
+    return _operate(path, 'stop', pair=True)
+
+
+def restart(path, pair=False, expected_revision=None):
+    return _operate(path, 'restart', pair=pair, expected_revision=expected_revision)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('start', 'stop', 'status', 'start-pair', 'stop-pair'))
+    parser.add_argument('path', nargs='?', default=os.getcwd())
+    args = parser.parse_args()
+    action = globals()[args.action.replace('-', '_')]
+    result = action(args.path)
+    print(json.dumps(result))
+    return 0 if result.get('ok', True) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

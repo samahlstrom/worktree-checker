@@ -1,0 +1,46 @@
+name: Check and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python -m pip install pyinstaller==6.22.0
+      - run: python scripts/build.py
+      - run: ditto -c -k --sequesterRsrc --keepParent 'dist/Worktree Checker.app' 'worktree-checker-macos-${{ matrix.arch }}.zip'
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "Worktree Checker $GITHUB_REF_NAME" --generate-notes || gh release view "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" 'worktree-checker-macos-${{ matrix.arch }}.zip' --clobber

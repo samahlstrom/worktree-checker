@@ -1,0 +1,27 @@
+"""Discover primary Git checkouts without an agent harness registry."""
+import json
+import os
+from pathlib import Path
+import re
+
+
+def normalize_github_full_name(url):
+    match = re.fullmatch(
+        r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([\w.-]+/[\w.-]+?)(?:\.git)?/?",
+        url.strip(), re.IGNORECASE
+    )
+    return match[1] if match else None
+
+
+def repo_roots():
+    home = Path.home()
+    roots = {home / ".forge"}
+    # Shallow discovery avoids walking dependency folders or worktree copies.
+    roots.update(p.parent for p in (home / "Documents/GitHub").glob("*/.git") if p.is_dir())
+    registrations = home / ".local/state/agent-maintenance/worktree-repositories.json"
+    try:
+        roots.update(Path(p) for p in json.loads(registrations.read_text()).values())
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    roots.update(Path(p).expanduser() for p in os.environ.get("WORKTREE_BOARD_ROOTS", "").split(os.pathsep) if p)
+    return sorted(str(p.resolve()) for p in roots if (p / ".git").is_dir())

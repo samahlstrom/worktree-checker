@@ -1,0 +1,1811 @@
+#!/usr/bin/env python3
+"""bin/board -- one bookmarkable page listing every worktree's dev-server
+preview link, across every repo the fleet has ever touched.
+
+Click a stopped row's Start, wait for the poll to catch the dev server
+answering, land on the running app. Click a running row's link straight
+through, or Stop it. Links only -- no chat box, no shot lists, no
+screenshots; those are separate future work.
+
+No CDN, no framework: stdlib http.server plus the small amount of JS the
+readiness poll and client-side search need.
+"""
+import argparse
+import hashlib
+import html
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import threading
+import urllib.parse
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+AVATAR_PATH = os.path.join(os.path.dirname(BIN), "assets", "sam-pixel.png")
+PORT = 7777
+LINEAR_ID_RE = re.compile(r"([A-Z]{2,10}-\d+)")
+
+# 90s TTL: gh pr list is ~1.7s per repo and we walk ~14 roots. A 90s window
+# keeps a busy refresh cycle (open page, start a server, refresh) free of
+# gh calls, while still picking up merges within about a minute and a half.
+# 60s would thrash on slow multi-repo loads; 120s is fine but slightly stale
+# for "I just merged that" glances. 90 sits in the middle.
+PR_CACHE_TTL_S = 90
+_PR_CACHE = {}  # full_name -> {expires, by_branch}
+_PR_LOCK = threading.Lock()
+_PR_FETCHING = set()
+
+# A commit/rebase changes the compiled module graph; Vite HMR handles ordinary
+# edits. Wait briefly for Git to settle, then restart only the affected preview.
+REVISION_DEBOUNCE_S = 2.0
+REVISION_POLL_S = 1.0
+_REVISION_PENDING = {}  # worktree path -> (observed HEAD, first-seen monotonic)
+
+
+def _load(name, filename):
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(BIN, filename))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+repositories = _load("board_repositories", "repositories")
+preview = _load("board_preview", "preview")
+
+
+
+
+
+def clear_pr_cache():
+    """Drop the in-process PR list cache (tests; also available for manual refresh)."""
+    _PR_CACHE.clear()
+
+
+def pr_state_label(gh_state):
+    """Map GitHub PR state to Sam's labels.
+
+    OPEN -> Open, MERGED -> Merged, CLOSED (not merged) -> Cancelled.
+    """
+    if not gh_state:
+        return ""
+    s = str(gh_state).upper()
+    if s == "OPEN":
+        return "Open"
+    if s == "MERGED":
+        return "Merged"
+    if s == "CLOSED":
+        return "Cancelled"
+    return ""
+
+
+def origin_full_name(repo_root):
+    """GitHub Owner/repo from the origin remote, or None if missing/non-GitHub."""
+    if not repo_root:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_root, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return repositories.normalize_github_full_name((r.stdout or "").strip())
+
+
+def project_identity(repo_root):
+    """(owner, project) for filtering.
+
+    GitHub origin -> ("HealthTree", "HealthTree/one"). No remote / non-GitHub
+    falls back to ("", basename) so local roots stay filterable.
+    Reuses origin_full_name -- no second remote parser.
+    """
+    full = origin_full_name(repo_root)
+    if full and "/" in full:
+        owner, _repo = full.split("/", 1)
+        return owner, full
+    return "", os.path.basename(os.path.realpath(repo_root or "") or "")
+
+
+def project_filter_options(rows):
+    """Build select options from rows present. No hardcoded repo names.
+
+    Returns list of (value, label): 'all', owner:Owner, project:Owner/repo
+    (or project:dirname for no-remote roots). Owners and projects are
+    individually selectable -- HealthTree matches one+next; HealthTree/one
+    matches only one.
+    """
+    owners = set()
+    projects = set()
+    for r in rows or []:
+        owner = (r.get("owner") or "").strip()
+        project = (r.get("project") or "").strip()
+        if owner:
+            owners.add(owner)
+        if project:
+            projects.add(project)
+    opts = [("all", "All projects")]
+    for owner in sorted(owners, key=str.lower):
+        opts.append((f"owner:{owner}", owner))
+    for project in sorted(projects, key=str.lower):
+        opts.append((f"project:{project}", project))
+    return opts
+
+
+def row_matches_project(row, selection):
+    """True if row matches project filter value (all | owner:X | project:Y)."""
+    sel = (selection or "all").strip()
+    if not sel or sel == "all":
+        return True
+    if sel.startswith("owner:"):
+        return (row.get("owner") or "") == sel[len("owner:"):]
+    if sel.startswith("project:"):
+        return (row.get("project") or "") == sel[len("project:"):]
+    return True
+
+
+def row_matches_search(row, needle):
+    """True if row's search blob contains needle (empty needle matches all)."""
+    n = (needle or "").strip().lower()
+    if not n:
+        return True
+    return n in _search_blob(row)
+
+
+def _project_options_html(rows):
+    parts = []
+    for value, label in project_filter_options(rows):
+        parts.append(
+            f'<option value="{html.escape(value, quote=True)}">'
+            f'{html.escape(label)}</option>'
+        )
+    return "\n".join(parts)
+
+
+def _default_gh_runner(args, **kwargs):
+    return subprocess.run(args, capture_output=True, text=True, timeout=kwargs.get("timeout", 20))
+
+
+def _run_gh_pr_list(full_name, runner=None):
+    """One gh pr list for the repo. Returns list of PR dicts, or [] on any failure."""
+    runner = runner or _default_gh_runner
+    try:
+        r = runner(
+            [
+                "gh", "pr", "list",
+                "--repo", full_name,
+                "--state", "all",
+                "--limit", "500",
+                "--json", "number,headRefName,state,url,title",
+            ],
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if getattr(r, "returncode", 1) != 0:
+        return []
+    try:
+        data = json.loads(r.stdout or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def list_prs_for_repo(repo_root, full_name=None, runner=None, now=None):
+    """Show Git rows immediately; fill PR details from one background fetch."""
+    name = full_name if full_name is not None else origin_full_name(repo_root)
+    if not name:
+        return {}
+    with _PR_LOCK:
+        hit = _PR_CACHE.get(name, {'expires': 0, 'by_branch': {}})
+        if hit['expires'] <= time.time() and name not in _PR_FETCHING:
+            _PR_FETCHING.add(name)
+            def refresh():
+                try:
+                    prs = _run_gh_pr_list(name, runner=runner)
+                    by_branch = {pr['headRefName']: pr for pr in prs
+                                 if isinstance(pr, dict) and pr.get('headRefName')}
+                    with _PR_LOCK:
+                        _PR_CACHE[name] = {'expires': time.time() + PR_CACHE_TTL_S,
+                                           'by_branch': by_branch}
+                finally:
+                    with _PR_LOCK:
+                        _PR_FETCHING.discard(name)
+            threading.Thread(target=refresh, daemon=True).start()
+        return hit['by_branch']
+
+
+def _parse_worktrees(repo_root):
+    """Every LINKED worktree of repo_root (path/head/branch), excluding the
+    primary checkout, straight from git -- ground truth even for a worktree
+    whose directory was already deleted. The primary checkout is dropped on
+    purpose (switchboard-xt7): for a repo like `one`, its linked worktrees
+    live nested inside it (.claude/worktrees/<name>), so a dev server started
+    on the primary checkout watches every nested worktree copy too and
+    double-initializes Firebase. Sam previews branch work, not the main
+    checkout, so the row is simply never offered -- same exclusion bin/sweep
+    already applies (see its repo_worktrees)."""
+    r = subprocess.run(["git", "-C", repo_root, "worktree", "list", "--porcelain"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return []
+    entries, cur = [], {}
+    for line in r.stdout.splitlines() + [""]:
+        if not line:
+            if cur.get("path"):
+                entries.append(cur)
+            cur = {}
+        elif line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):].replace("refs/heads/", "", 1)
+        elif line == "detached":
+            cur["branch"] = ""
+    return entries[1:]  # git always lists the primary checkout first
+
+
+def _commit_dates(repo_root, heads):
+    """Map head sha -> %cI for a whole repo in one git call.
+
+    With ~150+ linked worktrees, a per-worktree `git log -1` was the next hang
+    risk after the old per-worktree oauth probe. --no-walk resolves each sha
+    without walking history.
+    """
+    unique = [h for h in dict.fromkeys(heads) if h]
+    if not unique:
+        return {}
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_root, "log", "--no-walk", "--format=%H\t%cI", *unique],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        if "\t" not in line:
+            continue
+        sha, date = line.split("\t", 1)
+        out[sha] = date
+    return out
+
+
+def _admin_fields(worktree_path):
+    """The worktree's root admin v3 target, if it has one.
+
+    Admin v3 runs from the worktree root on :3200. Its synthetic component
+    path is state only under .preview/admin; it never creates an admin tree.
+    Rows without scripts.admin:dev get no admin.
+    """
+    admin_path = preview.admin_component_path(worktree_path)
+    if preview.dev_command(admin_path) is None:
+        return {
+            "admin_path": "", "admin_running": False, "admin_port": None,
+            "admin_crashed": False, "admin_log_tail": "", "admin_message": "",
+            "admin_served_revision": "",
+        }
+    st = preview.status(admin_path)
+    return {
+        "admin_path": admin_path,
+        "admin_running": st["running"],
+        "admin_port": st["port"] or preview.ADMIN_PORT,
+        "admin_crashed": bool(st.get("crashed")),
+        "admin_log_tail": st.get("log_tail") or "",
+        "admin_message": st.get("message") or "",
+        "pid": st.get("pid"),
+        "admin_served_revision": preview.served_revision(admin_path) if st["running"] else "",
+    }
+
+
+def _empty_pr_fields():
+    return {
+        "pr_number": None,
+        "pr_url": "",
+        "pr_title": "",
+        "pr_state": "",
+        "pr_label": "",
+    }
+
+
+def _pr_fields(pr):
+    if not pr:
+        return _empty_pr_fields()
+    state = pr.get("state") or ""
+    return {
+        "pr_number": pr.get("number"),
+        "pr_url": pr.get("url") or "",
+        "pr_title": pr.get("title") or "",
+        "pr_state": state,
+        "pr_label": pr_state_label(state),
+    }
+
+
+def build_rows():
+    """One row per linked worktree across every discovered repo, newest commit
+    first. Repos with no dev server still appear -- branch, PR,
+    and state stay useful even when start is unavailable.
+
+    A worktree is startable only when package.json has scripts.dev. Non-
+    startable rows never get a Start button; they keep a reveal affordance
+    so Sam can open the folder.
+
+    PR data is joined on branch name after one cached `gh pr list` per repo
+    (never per worktree). Soft-fail: missing origin / non-GitHub / gh errors
+    leave PR cells empty rather than blanking the page.
+    """
+    rows = []
+    oauth_by_repo = {}
+    prs_by_repo = {}
+    identity_by_repo = {}
+    for repo_root in repositories.repo_roots():
+        entries = [entry for entry in _parse_worktrees(repo_root)
+                   if entry.get("path") and os.path.isdir(entry["path"])]
+        if not entries:
+            continue
+        if repo_root not in oauth_by_repo:
+            # Once per repo, not per worktree (114 worktrees x ~0.6s each hung
+            # the page): Google OAuth usage is a property of the app, not of
+            # which branch is checked out, so the repo's own checkout answers
+            # it for every one of its worktrees.
+            oauth_by_repo[repo_root] = preview.is_oauth_bound(repo_root)
+        if repo_root not in identity_by_repo:
+            identity_by_repo[repo_root] = project_identity(repo_root)
+        if repo_root not in prs_by_repo:
+            # One gh pr list per repo (cached). Never one call per worktree --
+            # that previously hung the page (see oauth note above).
+            try:
+                prs_by_repo[repo_root] = list_prs_for_repo(repo_root)
+            except Exception:
+                prs_by_repo[repo_root] = {}
+        dates = _commit_dates(repo_root, [e.get("head", "") for e in entries])
+        owner, project = identity_by_repo[repo_root]
+        for entry in entries:
+            path = entry["path"]
+            startable = preview.dev_command(path) is not None
+            # Non-startable trees never run a preview; skip pid/port IO.
+            if startable:
+                st = preview.status(path)
+                admin = _admin_fields(path)
+                # A process can die after its first status probe while its pair
+                # is being read. Reconcile both components once more before
+                # rendering so a refresh cannot promote that stale snapshot.
+                if st["running"] or admin["admin_running"]:
+                    st = preview.status(path)
+                    admin = _admin_fields(path)
+                running, port = st["running"], st["port"]
+                crashed = bool(st.get("crashed"))
+                log_tail = st.get("log_tail") or ""
+                status_message = st.get("message") or ""
+                served_revision = preview.served_revision(path) if running else ""
+            else:
+                running, port = False, None
+                crashed, log_tail, status_message, served_revision = False, "", "", ""
+                admin = _admin_fields(path)
+            branch = entry.get("branch", "")
+            m = LINEAR_ID_RE.search(branch)
+            pr = prs_by_repo[repo_root].get(branch)
+            head = entry.get("head", "")
+            row = {
+                "name": os.path.basename(path),
+                "repo": os.path.basename(repo_root),
+                "owner": owner,
+                "project": project,
+                "branch": branch,
+                "issue_id": (f"{project}#{re.search(r'#(\d+)', branch).group(1)}"
+                             if re.search(r"#(\d+)", branch) else m.group(1) if m else ""),
+                "commit_date": dates.get(head, ""),
+                "path": path,
+                "running": running,
+                "crashed": crashed,
+                "log_tail": log_tail,
+                "message": status_message,
+                "port": port,
+                "oauth_bound": oauth_by_repo[repo_root] if startable else False,
+                "startable": startable,
+                "head": head,
+                "served_revision": served_revision,
+            }
+            row.update(_pr_fields(pr))
+            row.update(admin)
+            rows.append(row)
+    rows.sort(key=lambda r: r["commit_date"], reverse=True)
+    # Running worktrees first. Two stable sorts, not one compound key: the date
+    # ordering above survives underneath. Among 160 rows the one actually
+    # serving is otherwise unfindable, and coming back from the app to stop it
+    # is exactly when you need it.
+    rows.sort(key=lambda r: not (r.get("running") or r.get("admin_running")))
+    return _mark_oauth_holder(rows)
+
+
+def _mark_oauth_holder(rows):
+    """Tell waiting rows which worktree holds each shared port.
+
+    :6173 (One/next) and :3200 (per-worktree admin) are both singletons for
+    different reasons. Naming the holder turns 'takes over' from a threat into
+    a fact -- and when nobody holds the port, the row says plain start instead
+    of claiming a takeover that is not happening.
+    """
+    oauth_holder = next((r["name"] for r in rows
+                         if r.get("oauth_bound") and r.get("running")), "")
+    admin_holder = next((r["name"] for r in rows if r.get("admin_running")), "")
+    for r in rows:
+        if r.get("oauth_bound") and not r.get("running"):
+            r["oauth_holder"] = oauth_holder
+        if r.get("admin_path") and not r.get("admin_running"):
+            r["admin_holder"] = admin_holder
+    return rows
+
+
+# Git touches <common-git-dir>/worktrees whenever a linked worktree is added or
+# removed, so its mtime is a free "did the set change?" signal. Caching the
+# listing behind it is what makes /api/fingerprint cheap enough to poll: the 14
+# `git worktree list` subprocesses cost ~0.47s, the stat costs microseconds.
+_WORKTREE_LIST_CACHE = {}   # repo_root -> (mtime_ns, [path, ...])
+_GIT_COMMON_DIR = {}        # repo_root -> common git dir (never moves)
+
+
+def _worktrees_admin_dir(repo_root):
+    """<common git dir>/worktrees, or None. Resolved once per repo."""
+    if repo_root not in _GIT_COMMON_DIR:
+        try:
+            r = subprocess.run(["git", "-C", repo_root, "rev-parse", "--git-common-dir"],
+                               capture_output=True, text=True, timeout=10)
+            common = r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            common = ""
+        if common and not os.path.isabs(common):
+            common = os.path.join(repo_root, common)
+        _GIT_COMMON_DIR[repo_root] = common
+    common = _GIT_COMMON_DIR[repo_root]
+    return os.path.join(common, "worktrees") if common else None
+
+
+def _admin_dir_signature(repo_root):
+    """Notice completed adds, moves, branch changes, and removals in Git itself."""
+    admin = _worktrees_admin_dir(repo_root)
+    if not admin:
+        return []
+    try:
+        entries = sorted(os.listdir(admin))
+    except OSError:
+        return []
+    signature = []
+    for entry in entries:
+        files = []
+        for name in ('gitdir', 'HEAD'):
+            try:
+                stat = os.stat(os.path.join(admin, entry, name))
+                files.append((name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                files.append((name, None, None))
+        signature.append((entry, files))
+    return signature
+
+
+def _cached_worktree_paths(repo_root):
+    """Linked worktree paths for one repo, re-listed only when git's admin dir
+    changed. Falls back to listing every time if the mtime is unreadable."""
+    sig = _admin_dir_signature(repo_root)
+    hit = _WORKTREE_LIST_CACHE.get(repo_root)
+    if hit and hit[0] == sig:
+        return hit[1]
+    paths = [e.get("path", "") for e in _parse_worktrees(repo_root) if e.get("path")]
+    _WORKTREE_LIST_CACHE[repo_root] = (sig, paths)
+    return paths
+
+
+def _cached_repo_roots(now=None):
+    # Shallow local directory reads; new repos must not wait for a TTL.
+    return list(repositories.repo_roots())
+
+
+def fingerprint():
+    """Local inventory and process state only; never wait for GitHub."""
+    parts = []
+    for root in _cached_repo_roots():
+        parts.append((root, _admin_dir_signature(root)))
+        parts.extend((path, os.path.isdir(path), os.path.isfile(os.path.join(path, 'package.json')))
+                     for path in _cached_worktree_paths(root))
+    state = preview._load_state()
+    processes = preview._processes() if state else {}
+    parts.append([(path, record, bool(preview._members(record, processes)))
+                  for path, record in sorted(state.items())])
+    parts.append({name: hit['by_branch'] for name, hit in list(_PR_CACHE.items())})
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _search_blob(row):
+    parts = [
+        row.get("name") or "",
+        row.get("repo") or "",
+        row.get("owner") or "",
+        row.get("project") or "",
+        row.get("branch") or "",
+        row.get("issue_id") or "",
+    ]
+    if row.get("pr_number") is not None:
+        parts.append(str(row["pr_number"]))
+        parts.append("#" + str(row["pr_number"]))
+    parts.append(row.get("pr_title") or "")
+    parts.append(row.get("pr_label") or "")
+    parts.append(row.get("pr_state") or "")
+    if row.get("startable"):
+        parts.append("startable")
+    else:
+        parts.append("no dev server")
+        parts.append("not startable")
+    if row.get("crashed"):
+        parts.append("crashed")
+    return " ".join(parts).lower()
+
+
+def start_pair(worktree_path, force=False):
+    return preview.start_pair(worktree_path, force=force)
+
+
+
+
+
+def stop_pair(worktree_path):
+    return preview.stop_pair(worktree_path)
+
+
+def restart_pair(worktree_path, expected_revision=None):
+    return preview.restart(worktree_path, pair=True, expected_revision=expected_revision)
+
+
+def refresh_running_previews(now=None):
+    """Debounce committed HEAD changes, then restart their exact preview(s)."""
+    now = time.monotonic() if now is None else now
+    for repo_root in _cached_repo_roots():
+        for path in _cached_worktree_paths(repo_root):
+            if not os.path.isdir(path) or preview.dev_command(path) is None:
+                continue
+            main = preview.status(path)
+            admin_path = preview.admin_component_path(path)
+            admin = preview.status(admin_path)
+            if not main.get("running") and not admin.get("running"):
+                _REVISION_PENDING.pop(path, None)
+                continue
+            current = preview.worktree_revision(path)
+            if not current:
+                _REVISION_PENDING.pop(path, None)
+                continue
+            served = [
+                preview.served_revision(path) if main.get("running") else "",
+                preview.served_revision(admin_path) if admin.get("running") else "",
+            ]
+            running_revisions = [
+                revision for revision, running in zip(
+                    served, (main.get("running"), admin.get("running"))
+                ) if running
+            ]
+            if all(revision == current for revision in running_revisions):
+                _REVISION_PENDING.pop(path, None)
+                continue
+            pending = _REVISION_PENDING.get(path)
+            if pending is None or pending[0] != current:
+                _REVISION_PENDING[path] = (current, now)
+                continue
+            if now - pending[1] < REVISION_DEBOUNCE_S:
+                continue
+            if main.get("running") and admin.get("running"):
+                result = restart_pair(path, expected_revision=current)
+            elif main.get("running"):
+                result = preview.restart(path, expected_revision=current)
+            else:
+                result = preview.restart(admin_path, expected_revision=current)
+            if result.get("ok"):
+                _REVISION_PENDING.pop(path, None)
+
+
+def _revision_watcher():
+    while True:
+        try:
+            refresh_running_previews()
+        except Exception:
+            pass
+        time.sleep(REVISION_POLL_S)
+
+
+def _reveal_path(path):
+    """Open the worktree folder in the OS file manager. Local tool only."""
+    if not path or not os.path.isdir(path):
+        return {"ok": False, "error": "bad_path"}
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+def _admin_login_recovery_link(port):
+    """Explicit local recovery; normal admin links deliberately leave sessions alone."""
+    url = f"http://localhost:{port}{preview.LOCAL_ADMIN_BOOTSTRAP_PATH}"
+    return (
+        f'<a class="btn admin-recovery" href="{html.escape(url)}" target="_blank" '
+        'rel="noopener" title="Clear the local session and open admin login">'
+        'reset admin login</a>'
+    )
+
+
+def _running_banner(rows):
+    """Header line naming what is serving right now, with a stop control.
+
+    The table alone does not answer 'what is up?' once there are 160 rows, and
+    the moment you need that answer is when you come back from the app wanting
+    the port released. Empty string when nothing runs, so the header stays quiet.
+
+    A HealthTree/one row can hold both :6173 (app) and :3200 (that worktree's
+    admin). Show both ports on one chip and stop them together.
+    """
+    live = [r for r in rows if r.get("running") or r.get("admin_running")]
+    if not live:
+        return ""
+    items = []
+    for r in live:
+        path_q = html.escape(urllib.parse.quote(r["path"]), quote=True)
+        links = []
+        if r.get("running"):
+            links.append(
+                f'<a class="live-link" href="http://localhost:{r["port"]}/" '
+                f'target="_blank" rel="noopener">{html.escape(r["name"])}'
+                f'<span class="live-port">:{r["port"]}</span></a>'
+            )
+        if r.get("admin_running"):
+            label = html.escape(r["name"]) if not r.get("running") else "admin"
+            links.append(
+                f'<a class="live-link" href="http://localhost:{r["admin_port"]}/" '
+                f'target="_blank" rel="noopener">{label}'
+                f'<span class="live-port">:{r["admin_port"]}</span></a>'
+            )
+        if r.get("running") and r.get("admin_running") and r.get("admin_path"):
+            links.append(_admin_login_recovery_link(r["admin_port"]))
+        if r.get("admin_path"):
+            stop = (f'<button class="btn stop stop-pair" data-path="{path_q}">'
+                    f'stop both</button>')
+        else:
+            stop = f'<button class="btn stop" data-path="{path_q}">stop</button>'
+        items.append(
+            f'<span class="live-item">'
+            + "".join(links)
+            + stop
+            + '</span>'
+        )
+    return ('<div class="live-bar"><span class="live-dot">●</span>'
+            '<span class="live-label">serving now</span>'
+            + "".join(items) + '</div>')
+
+
+def copy_payload(row):
+    """The handoff block the copy button puts on the clipboard.
+
+    Carries path and branch alongside the name/PR/issue Sam asked for: those
+    are what make the paste actionable without a round of "which worktree?"
+    questions. Lines are omitted rather than left blank so a detached or
+    PR-less row pastes clean.
+    """
+    lines = [f"worktree: {row.get('name', '')}"]
+    if row.get("project"):
+        lines.append(f"project: {row['project']}")
+    if row.get("branch"):
+        lines.append(f"branch: {row['branch']}")
+    if row.get("issue_id"):
+        lines.append(f"issue: {row['issue_id']}")
+    if row.get("pr_number") is not None:
+        pr = f"pr: #{row['pr_number']}"
+        if row.get("pr_label"):
+            pr += f" ({row['pr_label']})"
+        if row.get("pr_url"):
+            pr += f" {row['pr_url']}"
+        lines.append(pr)
+    if row.get("path"):
+        lines.append(f"path: {row['path']}")
+    if row.get("running") and row.get("port"):
+        lines.append(f"serving: http://localhost:{row['port']}/")
+    return "\n".join(lines)
+
+
+def _copy_button(row):
+    # Newlines survive as &#10;: a raw \n in an attribute is legal but gets
+    # normalised to a space by the parser, which would flatten the block.
+    payload = html.escape(copy_payload(row), quote=True).replace("\n", "&#10;")
+    return (f'<button class="btn copy" data-copy="{payload}" '
+            f'title="Copy this card&#39;s details to paste into chat">copy</button>')
+
+
+def _pair_capable(row):
+    """True when this worktree has root app and admin v3 dev scripts.
+
+    preview.dev_command resolves the admin component to scripts.admin:dev;
+    other repositories without that script leave admin_path empty.
+    """
+    return bool(row.get("startable") and row.get("admin_path"))
+
+
+def _admin_button(row):
+    """Solo admin control for non-pair rows, or partial recovery.
+
+    Pair-capable rows use start-pair / stop-pair as the primary action; this
+    button only appears when the row has admin but is not startable (no root
+    dev server), so admin can still be brought up alone.
+    """
+    admin_path = row.get("admin_path") or ""
+    if not admin_path:
+        return ""
+    q = html.escape(urllib.parse.quote(admin_path), quote=True)
+    if row.get("admin_running"):
+        url = f"http://localhost:{row['admin_port']}/"
+        return (f'<a class="btn admin-open" href="{html.escape(url)}" target="_blank" '
+                f'rel="noopener">admin :{row["admin_port"]}</a> '
+                f'<button class="btn stop" data-path="{q}">stop admin</button>')
+    label = f"admin :{preview.ADMIN_PORT}"
+    if row.get("admin_holder"):
+        label += " (takes over)"
+    return (f'<button class="btn start admin-start" data-path="{q}">'
+            f'{html.escape(label)}</button>')
+
+
+def _start_label(row):
+    """What the start button actually promises.
+
+    Only an OAuth row can displace another worktree, and only while one is
+    really holding the port -- otherwise 'takes over' is a threat about nothing.
+    """
+    if not row.get("oauth_bound"):
+        return "start"
+    # Deliberately does not name the holder: worktree names run to 40+ chars
+    # (eng-5143-coach-training-per-lesson-completion) and blew the action column
+    # past the table edge. The banner above names who is serving.
+    if row.get("oauth_holder"):
+        return f"start :{preview.OAUTH_PORT} (takes over)"
+    return f"start :{preview.OAUTH_PORT}"
+
+
+def _pair_start_label(row):
+    """One-click start for the impersonation pair: app :6173 + this worktree's admin :3200.
+
+    Either shared port already held by another worktree triggers the same
+    '(takes over)' wording the solo OAuth start button already uses.
+    """
+    base = f"start :{preview.OAUTH_PORT} + admin"
+    if row.get("oauth_holder") or row.get("admin_holder"):
+        return f"{base} (takes over)"
+    return base
+
+
+def _pair_actions(row, path_q):
+    """Primary controls when the worktree has both One and admin."""
+    bits = []
+    both = bool(row.get("running") and row.get("admin_running"))
+    either = bool(row.get("running") or row.get("admin_running"))
+    if not both:
+        bits.append(
+            f'<button class="btn start start-pair" data-path="{path_q}">'
+            f'{html.escape(_pair_start_label(row))}</button>'
+        )
+    if row.get("running"):
+        url = f"http://localhost:{row['port']}/"
+        bits.append(
+            f'<a class="btn open" href="{html.escape(url)}" target="_blank">open</a>'
+        )
+    if row.get("admin_running"):
+        admin_url = f"http://localhost:{row['admin_port']}/"
+        bits.append(
+            f'<a class="btn admin-open" href="{html.escape(admin_url)}" '
+            f'target="_blank" rel="noopener">admin :{row["admin_port"]}</a>'
+        )
+        if both:
+            bits.append(_admin_login_recovery_link(row["admin_port"]))
+    if both:
+        # Admin is the impersonation entry: sign in, then "Log in as user".
+        admin_url = f"http://localhost:{row['admin_port']}/"
+        bits.append(
+            f'<a class="btn open impersonate" href="{html.escape(admin_url)}" '
+            f'target="_blank" rel="noopener" '
+            f'title="Sign in to admin, then Log in as user to land on :'
+            f'{preview.OAUTH_PORT}">impersonate</a>'
+        )
+    if either:
+        bits.append(
+            f'<button class="btn stop stop-pair" data-path="{path_q}">stop both</button>'
+        )
+    bits.append(_copy_button(row))
+    bits.append(
+        f'<button class="btn reveal" data-path="{path_q}" '
+        f'title="Reveal in Finder">reveal</button>'
+    )
+    return " ".join(bits)
+
+
+def _served_identity(row):
+    """Visible proof of the exact worktree revision a live process serves."""
+    revision = row.get("served_revision") or row.get("admin_served_revision") or ""
+    if not revision:
+        return ""
+    head = row.get("head") or ""
+    stale = bool(head and revision != head)
+    label = f"stale {revision[:8]} → {head[:8]}" if stale else f"served {revision[:8]}"
+    title = f"Serving {row.get('path') or ''} at {revision}"
+    return (f' <span class="{"crashed" if stale else "shared"}" '
+            f'title="{html.escape(title, quote=True)}">{html.escape(label)}</span>')
+
+
+def _pair_status(row):
+    """Status cell for a pair-capable row: show both ports when either is up."""
+    notes = _shared_port_note(row)
+    identity = _served_identity(row)
+    if row.get("running") and row.get("admin_running"):
+        return (f'<span class="running">● running :{row["port"]} + admin :'
+                f'{row["admin_port"]}</span>{identity}{notes}')
+    if row.get("running"):
+        admin_state = "crashed" if row.get("admin_crashed") else "stopped"
+        status = (f'<span class="running">● running :{row["port"]}</span>'
+                  f'<span class="{"crashed" if row.get("admin_crashed") else "stopped"}">'
+                  f' · admin {admin_state}</span>{identity}{notes}')
+        if row.get("admin_message"):
+            status += f'<div class="crash-msg">{html.escape(row["admin_message"])}</div>'
+        if row.get("admin_log_tail"):
+            status += f'<pre class="crash-log">{html.escape(row["admin_log_tail"])}</pre>'
+        return status
+    if row.get("admin_running"):
+        app_state = "crashed" if row.get("crashed") else "stopped"
+        status = (f'<span class="running">● admin :{row["admin_port"]}</span>'
+                  f'<span class="{"crashed" if row.get("crashed") else "stopped"}">'
+                  f' · app {app_state}</span>{identity}{notes}')
+        if row.get("message"):
+            status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
+        if row.get("log_tail"):
+            status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
+        return status
+    if row.get("admin_crashed"):
+        status = f'<span class="crashed">✕ admin crashed</span>{notes}'
+        if row.get("admin_message"):
+            status += f'<div class="crash-msg">{html.escape(row["admin_message"])}</div>'
+        if row.get("admin_log_tail"):
+            status += f'<pre class="crash-log">{html.escape(row["admin_log_tail"])}</pre>'
+        return status
+    if row.get("crashed"):
+        port_bit = f" :{row['port']}" if row.get("port") else ""
+        status = (f'<span class="crashed">✕ crashed{html.escape(port_bit)}</span>{notes}')
+        if row.get("message"):
+            status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
+        if row.get("log_tail"):
+            status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
+        return status
+    return f'<span class="stopped">○ stopped</span>{notes}'
+
+
+def _shared_port_note(row):
+    """Badge every OAuth row carries, running or not: this worktree can only
+    serve on the one port Google's OAuth client will accept, so its repo's
+    worktrees take turns. Stopped rows need it most -- that is where the
+    surprise ('why did my other tab die?') actually lands."""
+    if not row.get("oauth_bound"):
+        return ""
+    return (f' <span class="shared" title="HealthTree sign-in only works on '
+            f'localhost:{preview.OAUTH_PORT}, so one worktree serves at a time">'
+            f'shared :{preview.OAUTH_PORT}</span>')
+
+
+def _row_html(row):
+    path_q = html.escape(urllib.parse.quote(row["path"]), quote=True)
+    linear = html.escape(row["issue_id"]) if row["issue_id"] else "—"
+    branch = html.escape(row["branch"] or "(detached)")
+    date = html.escape(row["commit_date"][:10] or "—")
+    search = html.escape(_search_blob(row), quote=True)
+    owner = html.escape(row.get("owner") or "", quote=True)
+    project = html.escape(row.get("project") or row.get("repo") or "", quote=True)
+    startable = row.get("startable", True)
+    # Trailing controls every row carries, startable or not -- a worktree with
+    # no dev server is still something to hand over with a comment attached.
+    # The admin sits here too: it is independent of the main app's state, so a
+    # row with no root dev server can still have one.
+    admin_btn = _admin_button(row)
+    reveal = ((f'{admin_btn} ' if admin_btn else "")
+              + f'{_copy_button(row)} '
+              + f'<button class="btn reveal" data-path="{path_q}" '
+                f'title="Reveal in Finder">reveal</button>')
+
+    if _pair_capable(row):
+        # Primary interaction: one click starts app :6173 + this worktree's
+        # admin :3200 (the impersonation precondition).
+        status = _pair_status(row)
+        action = _pair_actions(row, path_q)
+        if row.get("running") or row.get("admin_running"):
+            row_class = " is-running"
+        elif row.get("crashed") or row.get("admin_crashed"):
+            row_class = " is-crashed"
+        else:
+            row_class = ""
+    elif not startable:
+        status = '<span class="no-dev">no dev server</span>'
+        action = reveal
+        row_class = " not-startable"
+    elif row["running"]:
+        # localhost, not 127.0.0.1: a plain `vite dev` (no --host) binds
+        # IPv6 loopback only -- see preview.port_is_ready's same note.
+        url = f"http://localhost:{row['port']}/"
+        status = (f'<span class="running">● running :{row["port"]}</span>'
+                  f'{_served_identity(row)}{_shared_port_note(row)}')
+        action = (f'<a class="btn open" href="{html.escape(url)}" target="_blank">open</a> '
+                 f'<button class="btn stop" data-path="{path_q}">stop</button> '
+                 f'{reveal}')
+        row_class = " is-running"
+    elif row.get("crashed"):
+        # Dead process (not intentional stop). Show log tail so Sam sees the
+        # Firebase/node reason without hunting .preview/log (switchboard-9hz).
+        port_bit = f" :{row['port']}" if row.get("port") else ""
+        status = (f'<span class="crashed">✕ crashed{html.escape(port_bit)}</span>'
+                  f'{_shared_port_note(row)}')
+        if row.get("message"):
+            status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
+        if row.get("log_tail"):
+            status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
+        label = _start_label(row)
+        action = (f'<button class="btn start" data-path="{path_q}">{html.escape(label)}</button> '
+                 f'{reveal}')
+        row_class = " is-crashed"
+    else:
+        status = f'<span class="stopped">○ stopped</span>{_shared_port_note(row)}'
+        label = _start_label(row)
+        action = (f'<button class="btn start" data-path="{path_q}">{html.escape(label)}</button> '
+                 f'{reveal}')
+        row_class = ""
+
+    if row.get("pr_number") is not None and row.get("pr_url"):
+        pr_cell = (
+            f'<a class="pr-link" href="{html.escape(row["pr_url"])}" '
+            f'target="_blank" rel="noopener" title="{html.escape(row.get("pr_title") or "")}">'
+            f'#{html.escape(str(row["pr_number"]))}</a>'
+        )
+        pill_class = {
+            "Open": "open",
+            "Merged": "merged",
+            "Cancelled": "cancelled",
+        }.get(row.get("pr_label") or "", "")
+        state_cell = (
+            f'<span class="pill {pill_class}">{html.escape(row["pr_label"])}</span>'
+            if pill_class else "—"
+        )
+    else:
+        pr_cell = "—"
+        state_cell = "—"
+
+    # Project cell: show Owner/repo when known, else bare repo basename.
+    project_display = row.get("project") or row.get("repo") or ""
+    project_cell = html.escape(project_display)
+
+    return (f'<tr class="{row_class.strip()}" data-path="{path_q}" data-search="{search}"'
+           f' data-owner="{owner}" data-project="{project}"'
+           f' data-name="{html.escape(row["name"], quote=True)}"'
+           f' data-startable="{"1" if startable else "0"}">'
+           f'<td class="project" title="{project}">{project_cell}</td>'
+           f'<td>{html.escape(row["name"])}</td>'
+           f'<td class="branch">{branch}</td>'
+           f'<td>{linear}</td>'
+           f'<td class="pr">{pr_cell}</td>'
+           f'<td class="pr-state">{state_cell}</td>'
+           f'<td>{date}</td>'
+           f'<td>{status}</td>'
+           f'<td class="action">{action}</td>'
+           f'</tr>')
+
+
+# Placeholders are __TOKENS__, not {} -- this template is mostly CSS, and
+# .format would force every brace in it to be doubled.
+STARTING_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>starting __NAME__…</title>
+<style>
+:root {
+  --bg: #F7F6F3;
+  --surface: #FFFFFF;
+  --ink: #2F3437;
+  --muted: #787774;
+  --line: #EAEAEA;
+  --run: #346538;
+  --run-soft: #D6E6D4;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "SF Pro Display", "Helvetica Neue", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.card { text-align: center; padding: 2rem 1.5rem; max-width: 26rem; }
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+.avatar {
+  width: 160px;
+  height: 160px;
+  /* The sprite is stored at its art resolution; smooth upscaling would mush
+     every block edge, which is the whole point of pixel art. He is deliberately
+     static -- the bulb above him carries the motion. */
+  image-rendering: pixelated;
+  display: block;
+}
+.bulb {
+  width: 58px;
+  height: 68px;
+  margin-bottom: -6px;
+  overflow: visible;
+}
+
+/* One 3.6s story, told twice over: the glass runs warm -> BRIGHT blink ->
+   dull stuttering flicker -> back to warm, and the rays ride the same clock so
+   they are longest exactly when the blink lands. */
+/* Sampled off the sprite's own silhouette pixels, not guessed at pure #000. */
+.outline { fill: #0A0A0A; }
+.glass { fill: #E3D9A6; animation: glassCycle 3.6s steps(1, end) infinite; }
+.filament { fill: #B08D2E; animation: filamentCycle 3.6s steps(1, end) infinite; }
+.base { fill: #8A8681; }
+.ray {
+  fill: #E9C84A;
+  opacity: 0;
+  animation: rayCycle 3.6s ease-in-out infinite;
+}
+@keyframes glassCycle {
+  0%   { fill: #E3D9A6; }
+  40%  { fill: #F2E08A; }
+  50%  { fill: #FFF7C4; }   /* blink bright */
+  58%  { fill: #FFFDF0; }
+  62%  { fill: #BFBCB4; }   /* drop dull, then stutter */
+  66%  { fill: #E8DCA0; }
+  70%  { fill: #BFBCB4; }
+  74%  { fill: #DCD2A2; }
+  78%  { fill: #BFBCB4; }
+  86%  { fill: #D2CCB6; }
+  100% { fill: #E3D9A6; }
+}
+@keyframes filamentCycle {
+  0%   { fill: #B08D2E; }
+  50%  { fill: #FFFFFF; }
+  62%  { fill: #6E6A64; }
+  66%  { fill: #C9A94A; }
+  70%  { fill: #6E6A64; }
+  78%  { fill: #6E6A64; }
+  100% { fill: #B08D2E; }
+}
+/* --rx/--ry per ray point outward from the bulb, so one keyframe block drives
+   every direction instead of five near-identical ones. */
+@keyframes rayCycle {
+  0%   { transform: translate(0, 0);                  opacity: 0; }
+  35%  { transform: translate(var(--rx), var(--ry));  opacity: 0.75; }
+  50%  { transform: translate(var(--rx), var(--ry));  opacity: 1; }
+  60%  { transform: translate(0, 0);                  opacity: 0.15; }
+  68%  { transform: translate(0, 0);                  opacity: 0.5; }
+  74%  { transform: translate(0, 0);                  opacity: 0.1; }
+  100% { transform: translate(0, 0);                  opacity: 0; }
+}
+h1 {
+  margin: 0.5rem 0 0.15rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.name {
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.8rem;
+  color: var(--muted);
+  word-break: break-all;
+  margin-bottom: 1.25rem;
+}
+#msg {
+  font-size: 0.85rem;
+  color: var(--muted);
+  min-height: 1.3em;
+}
+.hint {
+  margin-top: 1.75rem;
+  font-size: 0.75rem;
+  color: #A0A09C;
+}
+@media (prefers-reduced-motion: reduce) {
+  .glass, .filament, .ray { animation: none; }
+  .ray { opacity: 0.6; }
+}
+</style></head>
+<body>
+  <div class="card">
+    <div class="stage">
+      <!-- shape-rendering=crispEdges: no anti-aliasing, so the bulb reads as
+           the same pixel art as the sprite under it. -->
+      <svg class="bulb" viewBox="0 0 24 28" shape-rendering="crispEdges"
+           aria-hidden="true">
+        <rect class="ray" style="--rx:0px;--ry:-3px"  x="11" y="0"  width="2" height="3"/>
+        <rect class="ray" style="--rx:-3px;--ry:-2px" x="3"  y="2"  width="3" height="2"/>
+        <rect class="ray" style="--rx:3px;--ry:-2px"  x="18" y="2"  width="3" height="2"/>
+        <rect class="ray" style="--rx:-3px;--ry:0px"  x="0"  y="10" width="3" height="2"/>
+        <rect class="ray" style="--rx:3px;--ry:0px"   x="21" y="10" width="3" height="2"/>
+        <!-- Outline first: each shape's silhouette grown by one unit, drawn
+             behind, so exactly one unit of black shows all the way round --
+             the same treatment the sprite has. The gaps this leaves at y=16
+             and y=19 are the bulb's neck and screw thread. -->
+        <rect class="outline" x="7" y="4"  width="10" height="4"/>
+        <rect class="outline" x="5" y="6"  width="14" height="9"/>
+        <rect class="outline" x="7" y="13" width="10" height="4"/>
+        <rect class="outline" x="8" y="16" width="8"  height="8"/>
+        <rect class="glass" x="8" y="5"  width="8"  height="2"/>
+        <rect class="glass" x="6" y="7"  width="12" height="7"/>
+        <rect class="glass" x="8" y="14" width="8"  height="2"/>
+        <rect class="filament" x="11" y="9" width="2" height="4"/>
+        <rect class="base" x="9" y="17" width="6" height="2"/>
+        <rect class="base" x="9" y="20" width="6" height="2"/>
+      </svg>
+      <img class="avatar" src="/avatar.png" alt="">
+    </div>
+    <h1>Spinning up your dev server</h1>
+    <p class="name">__NAME__</p>
+    <p id="msg">waking the dev server…</p>
+    <p class="hint">This tab lands on the app by itself. Keep it open.</p>
+  </div>
+<script>
+// Cosmetic only: the board tab owns readiness and navigates this tab when the
+// server answers. Nothing here polls, so a stalled start cannot be hidden by a
+// cheerful message that keeps cycling forever.
+const MSGS = [
+  'waking the dev server…',
+  'warming up vite…',
+  'compiling routes…',
+  'still going — cold starts take a minute…',
+];
+let i = 0;
+const el = document.getElementById('msg');
+const timer = setInterval(() => { i = (i + 1) % MSGS.length; el.textContent = MSGS[i]; }, 3200);
+setTimeout(() => { clearInterval(timer); el.textContent = 'Return to the board to retry.'; }, 780000);
+</script>
+</body></html>
+"""
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>board</title>
+<style>
+:root {{
+  --bg: #F7F6F3;
+  --surface: #FFFFFF;
+  --ink: #2F3437;
+  --muted: #787774;
+  --line: #EAEAEA;
+  --soft: #F9F9F8;
+  --pill-open-bg: #EDF3EC;
+  --pill-open-fg: #346538;
+  --pill-merged-bg: #E1F3FE;
+  --pill-merged-fg: #1F6C9F;
+  --pill-cancelled-bg: #FDEBEC;
+  --pill-cancelled-fg: #9F2F2D;
+  --run: #346538;
+  --focus: #2F3437;
+  --nodev: #9B9590;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "SF Pro Display", "Helvetica Neue", "Geist Sans", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}}
+.wrap {{
+  /* 1280 clipped the last action button once copy made it four wide. */
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 3rem;
+}}
+header.top {{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  margin-bottom: 1.25rem;
+}}
+h1 {{
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: #111;
+}}
+.meta {{
+  color: var(--muted);
+  font-size: 0.85rem;
+}}
+#count, #total {{ font-variant-numeric: tabular-nums; }}
+.live-bar {{
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  background: #F3F8F2;
+  border: 1px solid #D6E6D4;
+  border-radius: 10px;
+  padding: 0.6rem 0.85rem;
+  margin-bottom: 1rem;
+}}
+.live-dot {{ color: var(--run); }}
+.live-label {{
+  color: var(--run);
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-right: 0.15rem;
+}}
+.live-item {{ display: inline-flex; align-items: center; gap: 0.4rem; }}
+.live-link {{
+  color: var(--ink);
+  text-decoration: none;
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.8rem;
+  border-bottom: 1px solid #C6DCC3;
+}}
+.live-link:hover {{ border-bottom-color: var(--run); }}
+.live-port {{ color: var(--run); font-weight: 600; margin-left: 0.3rem; }}
+.filter-bar {{
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}}
+.filter-bar label.sr {{
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0);
+  border: 0;
+}}
+#project {{
+  flex: 0 1 14rem;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--soft);
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--ink);
+  padding: 0.4rem 0.55rem;
+  outline: none;
+  min-width: 9rem;
+}}
+#project:focus {{ border-color: var(--ink); }}
+.search-bar {{
+  flex: 1 1 16rem;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-left: 1px solid var(--line);
+  padding-left: 0.75rem;
+}}
+@media (max-width: 640px) {{
+  .search-bar {{ border-left: none; padding-left: 0; border-top: 1px solid var(--line); padding-top: 0.55rem; }}
+}}
+#q {{
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  font: inherit;
+  font-size: 0.95rem;
+  color: var(--ink);
+  min-width: 0;
+}}
+#q::placeholder {{ color: #A0A09C; }}
+td.project {{
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}}
+.table-shell {{
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: auto;
+}}
+table {{
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 900px;
+}}
+th, td {{
+  text-align: left;
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.82rem;
+  vertical-align: middle;
+}}
+th {{
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.68rem;
+  background: var(--soft);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}}
+tbody tr:last-child td {{ border-bottom: none; }}
+tbody tr:hover td {{ background: rgba(0,0,0,0.015); }}
+tbody tr.is-hidden {{ display: none; }}
+tbody tr.not-startable td {{ color: var(--muted); }}
+tbody tr.not-startable .branch {{ color: var(--muted); }}
+tbody tr.is-running td {{ background: #F3F8F2; }}
+tbody tr.is-running:hover td {{ background: #EAF3E8; }}
+tbody tr.is-crashed td {{ background: #FDF2F2; }}
+tbody tr.is-crashed:hover td {{ background: #FCE8E8; }}
+.branch {{
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  max-width: 18rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}}
+.pr-link {{
+  color: var(--ink);
+  text-decoration: none;
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-weight: 500;
+  border-bottom: 1px solid var(--line);
+}}
+.pr-link:hover {{ border-bottom-color: var(--ink); }}
+.pill {{
+  display: inline-block;
+  border-radius: 9999px;
+  padding: 0.12rem 0.55rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  white-space: nowrap;
+}}
+.pill.open {{ background: var(--pill-open-bg); color: var(--pill-open-fg); }}
+.pill.merged {{ background: var(--pill-merged-bg); color: var(--pill-merged-fg); }}
+.pill.cancelled {{ background: var(--pill-cancelled-bg); color: var(--pill-cancelled-fg); }}
+.running {{ color: var(--run); font-weight: 500; }}
+.stopped {{ color: var(--muted); }}
+.crashed {{ color: var(--pill-cancelled-fg); font-weight: 500; }}
+.crash-msg {{
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--pill-cancelled-fg);
+  max-width: 28rem;
+}}
+.crash-log {{
+  display: block;
+  margin: 0.3rem 0 0;
+  padding: 0.35rem 0.45rem;
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--muted);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 28rem;
+  max-height: 5.5rem;
+  overflow: auto;
+}}
+.no-dev {{
+  color: var(--nodev);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}}
+.shared {{ color: var(--muted); font-size: 0.78em; }}
+.btn {{
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.22rem 0.65rem;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  text-decoration: none;
+  color: var(--ink);
+  display: inline-block;
+  line-height: 1.3;
+}}
+.btn:hover {{ background: var(--soft); }}
+.btn:active {{ transform: scale(0.98); }}
+.btn.open {{
+  background: #111;
+  color: #fff;
+  border-color: #111;
+}}
+.btn.open:hover {{ background: #333; border-color: #333; }}
+.btn.stop {{ color: var(--pill-cancelled-fg); }}
+.btn.reveal {{ color: var(--muted); }}
+.btn.copy {{ color: var(--muted); }}
+.btn.copied {{ background: var(--pill-open-bg); color: var(--pill-open-fg); border-color: #C6DCC3; }}
+.btn.start {{
+  background: #111;
+  color: #fff;
+  border-color: #111;
+}}
+.btn.start:hover {{ background: #333; border-color: #333; }}
+.action {{ white-space: nowrap; }}
+.action .btn + .btn, .action .btn + a.btn, .action a.btn + .btn {{ margin-left: 0.35rem; }}
+.empty {{
+  display: none;
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+}}
+.empty.show {{ display: block; }}
+</style></head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>board</h1>
+    <p class="meta"><span id="count">{count}</span> of <span id="total">{count}</span> worktrees</p>
+  </header>
+  {running_banner}
+  <div class="filter-bar">
+    <label class="sr" for="project">Project</label>
+    <select id="project" title="Filter by project">
+      {project_options}
+    </select>
+    <div class="search-bar">
+      <label class="sr" for="q">Search worktrees</label>
+      <input id="q" type="search" placeholder="Search worktree, repo, branch, issue, PR…"
+             autocomplete="off" spellcheck="false" autofocus>
+    </div>
+  </div>
+  <div class="table-shell" id="table-shell">
+    <table>
+      <thead>
+        <tr>
+          <th>project</th><th>worktree</th><th>branch</th><th>issue</th>
+          <th>pr</th><th>pr state</th>
+          <th>commit</th><th>status</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="rows">{rows}</tbody>
+    </table>
+    <p class="empty" id="empty">No worktrees match.</p>
+  </div>
+</div>
+<script>
+(function () {{
+  const q = document.getElementById('q');
+  const projectFilter = document.getElementById('project');
+  const countEl = document.getElementById('count');
+  const empty = document.getElementById('empty');
+  const rows = () => Array.from(document.querySelectorAll('#rows tr'));
+
+  function projectMatch(tr, sel) {{
+    if (!sel || sel === 'all') return true;
+    if (sel.indexOf('owner:') === 0) {{
+      return (tr.getAttribute('data-owner') || '') === sel.slice(6);
+    }}
+    if (sel.indexOf('project:') === 0) {{
+      return (tr.getAttribute('data-project') || '') === sel.slice(8);
+    }}
+    return true;
+  }}
+
+  function filter() {{
+    const needle = (q.value || '').trim().toLowerCase();
+    const sel = projectFilter.value || 'all';
+    let visible = 0;
+    for (const tr of rows()) {{
+      const hay = tr.getAttribute('data-search') || '';
+      const textOk = !needle || hay.indexOf(needle) !== -1;
+      const projOk = projectMatch(tr, sel);
+      const show = textOk && projOk;
+      tr.classList.toggle('is-hidden', !show);
+      if (show) visible++;
+    }}
+    countEl.textContent = String(visible);
+    empty.classList.toggle('show', visible === 0);
+  }}
+  // Survive a reload: an auto-refresh that silently cleared the search box
+  // would be worse than the staleness it fixes.
+  try {{
+    const savedQ = sessionStorage.getItem('board.q');
+    const savedP = sessionStorage.getItem('board.project');
+    if (savedQ) q.value = savedQ;
+    if (savedP) projectFilter.value = savedP;
+  }} catch (e) {{}}
+  function remember() {{
+    try {{
+      sessionStorage.setItem('board.q', q.value || '');
+      sessionStorage.setItem('board.project', projectFilter.value || 'all');
+    }} catch (e) {{}}
+  }}
+  q.addEventListener('input', () => {{ remember(); filter(); }});
+  projectFilter.addEventListener('change', () => {{ remember(); filter(); }});
+  filter();
+}})();
+
+// One bounded request per action. The backend owns startup and cleanup.
+window.__boardStarting = false;
+async function request(url, options = {{}}, timeout = 5000) {{
+  const response = await fetch(url, {{...options, signal: AbortSignal.timeout(timeout)}});
+  if (!response.ok) throw new Error('The board could not finish this request. Try again.');
+  return response.json();
+}}
+(function () {{
+  const MINE = "{fingerprint}";
+  let checking = false;
+  async function check() {{
+    if (checking || window.__boardStarting || document.hidden) return;
+    checking = true;
+    try {{
+      const data = await request('/api/fingerprint');
+      if (!window.__boardStarting && data.fingerprint !== MINE) location.reload();
+    }} catch (error) {{ /* Retry after a board restart. */ }}
+    finally {{ checking = false; }}
+  }}
+  document.addEventListener('visibilitychange', check);
+  setInterval(check, 500);
+}})();
+window.addEventListener('pageshow', e => {{ if (e.persisted) location.reload(); }});
+
+document.addEventListener('click', async e => {{
+  const btn = e.target.closest('button.btn');
+  if (!btn) return;
+  const path = btn.dataset.path;
+  if (btn.classList.contains('start') || btn.classList.contains('stop')) {{
+    if (window.__boardStarting) return;
+    const starting = btn.classList.contains('start');
+    const pair = btn.classList.contains('start-pair') || btn.classList.contains('stop-pair');
+    const label = btn.textContent;
+    const tab = starting ? window.open('/starting?name=' + encodeURIComponent(btn.closest('tr')?.dataset.name || ''), '_blank') : null;
+    window.__boardStarting = true;
+    btn.disabled = true;
+    btn.textContent = starting ? 'preparing and starting…' : 'stopping…';
+    try {{
+      const action = (starting ? 'start' : 'stop') + (pair ? '-pair' : '');
+      const data = await request('/api/' + action + '?path=' + path, {{method: 'POST'}}, 780000);
+      if (!data.ok) throw new Error([data.message || data.error || 'The action failed.', data.log_tail || ''].filter(Boolean).join('\\n'));
+      if (starting) {{
+        const land = pair
+          ? 'http://localhost:' + data.admin_port + (data.already_running ? '/' : '{admin_bootstrap_path}')
+          : 'http://localhost:' + data.port + '/';
+        if (tab && !tab.closed) tab.location = land; else window.open(land, '_blank');
+      }}
+      location.reload();
+    }} catch (error) {{
+      if (tab && !tab.closed) tab.close();
+      btn.textContent = starting ? 'could not start — retry' : 'could not stop — retry';
+      btn.title = error.message;
+      const detail = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = 'Show details';
+      const explanation = document.createElement('p');
+      explanation.textContent = error.message;
+      detail.append(summary, explanation);
+      btn.closest('td')?.append(detail);
+      setTimeout(() => {{ btn.textContent = label; }}, 5000);
+    }} finally {{
+      window.__boardStarting = false;
+      btn.disabled = false;
+    }}
+  }} else if (btn.classList.contains('copy')) {{
+    const label = btn.textContent;
+    try {{
+      await navigator.clipboard.writeText(btn.dataset.copy || '');
+      btn.textContent = 'copied';
+    }} catch (error) {{ btn.textContent = 'copy failed'; }}
+    btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = label; btn.classList.remove('copied'); }}, 1200);
+  }} else if (btn.classList.contains('reveal')) {{
+    btn.disabled = true;
+    try {{ await request('/api/reveal?path=' + path, {{method: 'POST'}}); }}
+    catch (error) {{ btn.textContent = 'reveal failed'; }}
+    finally {{ btn.disabled = false; }}
+  }}
+}});
+</script>
+</body></html>
+"""
+
+
+def render_starting_page(name):
+    """The waiting screen the popup shows while a dev server boots."""
+    return STARTING_PAGE.replace("__NAME__", html.escape(name or "worktree"))
+
+
+def render_page():
+    current_fingerprint = fingerprint()
+    rows = build_rows()
+    return PAGE.format(
+        count=len(rows),
+        rows="\n".join(_row_html(r) for r in rows),
+        project_options=_project_options_html(rows),
+        running_banner=_running_banner(rows),
+        oauth_port=preview.OAUTH_PORT,
+        admin_bootstrap_path=preview.LOCAL_ADMIN_BOOTSTRAP_PATH,
+        fingerprint=current_fingerprint,
+    )
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, body, status=200, content_type="text/html; charset=utf-8"):
+        b = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(b)))
+        # Every response here is live state (what is running, on which port).
+        # Without this the browser happily re-serves a cached board showing a
+        # server as stopped that you started minutes ago.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _json(self, obj):
+        self._send(json.dumps(obj), content_type="application/json")
+
+    def _query(self):
+        parsed = urllib.parse.urlparse(self.path)
+        return parsed.path, urllib.parse.parse_qs(parsed.query)
+
+    def _send_bytes(self, data, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path, qs = self._query()
+        if path == "/":
+            self._send(render_page())
+        elif path == "/starting":
+            self._send(render_starting_page(qs.get("name", [""])[0]))
+        elif path == "/avatar.png":
+            try:
+                with open(AVATAR_PATH, "rb") as f:
+                    self._send_bytes(f.read(), "image/png")
+            except OSError:
+                self.send_error(404)
+        elif path == "/api/fingerprint":
+            self._json({"fingerprint": fingerprint()})
+        elif path == "/api/ready":
+            port = int(qs.get("port", ["0"])[0])
+            self._json({"ready": bool(port) and preview.port_is_ready(port)})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        try:
+            self._post()
+        except Exception as error:
+            self._json({'ok': False, 'error': 'request_failed', 'message': str(error)})
+
+    def _post(self):
+        path, qs = self._query()
+        wt = qs.get("path", [""])[0]
+        if path == "/api/start":
+            force = qs.get("force", ["0"])[0] == "1"
+            self._json(preview.start(wt, force=force))
+        elif path == "/api/start-pair":
+            force = qs.get("force", ["0"])[0] == "1"
+            self._json(start_pair(wt, force=force))
+        elif path == "/api/stop":
+            self._json(preview.stop(wt))
+        elif path == "/api/stop-pair":
+            self._json(stop_pair(wt))
+        elif path == "/api/reveal":
+            self._json(_reveal_path(wt))
+        else:
+            self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        pass  # ponytail: a personal local tool doesn't need request-log noise
+
+
+URL = f"http://127.0.0.1:{PORT}"
+BOARD_LOG = os.path.expanduser("~/.local/state/worktree-preview-board/board.log")
+
+
+def already_serving():
+    """True when a board is already answering on PORT.
+
+    Starting a second one only crashes on bind, and 'it is already up, here is
+    the link' is the honest answer to someone who just wants the board open.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", PORT), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def start_background(wait_s=15.0):
+    """Launch a detached board and return once it actually answers.
+
+    start_new_session so it outlives the shell (or agent) that asked for it.
+    Returns True if the board is serving by the time we give up waiting.
+    """
+    os.makedirs(os.path.dirname(BOARD_LOG), exist_ok=True)
+    log = open(BOARD_LOG, "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__)],
+        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if already_serving():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="board", description=__doc__)
+    ap.add_argument("--background", action="store_true",
+                    help="start detached, print the URL, and exit")
+    args = ap.parse_args()
+
+    if already_serving():
+        print(f"{URL}  (already running)")
+        return
+    if args.background:
+        if start_background():
+            print(URL)
+            return
+        print(f"board did not come up within 15s; see {BOARD_LOG}", file=sys.stderr)
+        sys.exit(1)
+
+    threading.Thread(target=_revision_watcher, daemon=True,
+                     name="board-revision-watcher").start()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(URL)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

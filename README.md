@@ -8,7 +8,16 @@ registry. GitHub PR information is optional and never blocks the local list.
 
 ## Download
 
-Download the macOS ZIP for your Mac from [Releases](https://github.com/samahlstrom/worktree-checker/releases).
+On a Mac, paste this once into Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/samahlstrom/worktree-checker/main/install.sh | sh
+```
+
+It downloads the app, installs it in your Applications folder, and opens the board.
+There is no repository setup step.
+
+Or download the macOS ZIP for your Mac from [Releases](https://github.com/samahlstrom/worktree-checker/releases).
 Unzip, move **Worktree Checker.app** to Applications, and open it. The board opens at
 <http://127.0.0.1:7777> and starts at login thereafter.
 

@@ -1,8 +1,11 @@
 """Discover primary Git checkouts without an agent harness registry."""
+from collections import deque
 import json
 import os
 from pathlib import Path
 import re
+import threading
+import time
 
 
 def normalize_github_full_name(url):
@@ -13,15 +16,252 @@ def normalize_github_full_name(url):
     return match[1] if match else None
 
 
-def repo_roots():
-    home = Path.home()
-    roots = {home / ".forge"}
-    # Shallow discovery avoids walking dependency folders or worktree copies.
-    roots.update(p.parent for p in (home / "Documents/GitHub").glob("*/.git") if p.is_dir())
-    registrations = home / ".local/state/agent-maintenance/worktree-repositories.json"
+HOME = Path.home()
+DISCOVERY_STATE = HOME / ".local/state/worktree-preview-board/discovered-repositories.json"
+SHALLOW_HOMES = (
+    "Documents/GitHub",
+    "Documents/Projects",
+    "Documents/code",
+    "Projects",
+    "Developer",
+    "code",
+    "src",
+    "repos",
+    "Downloads",
+    "Desktop",
+    "work",
+    "workspace",
+    "dev",
+    "Sites",
+)
+SKIP_NAMES = frozenset({
+    ".cache",
+    ".git",
+    ".local",
+    ".next",
+    ".npm",
+    ".pnpm-store",
+    ".Trash",
+    ".yarn",
+    ".svelte-kit",
+    "build",
+    "cache",
+    "Caches",
+    "coverage",
+    "DerivedData",
+    "dist",
+    "Library",
+    "Media",
+    "Movies",
+    "Music",
+    "node_modules",
+    "Pictures",
+    "Pods",
+    "Photos Library.photoslibrary",
+    "target",
+    "vendor",
+})
+SCAN_INTERVAL_S = 60
+SCAN_SLICE_S = 0.5
+SCAN_SLICE_DIRS = 512
+SCAN_PAUSE_S = 0.05
+MAX_CACHED_REPOSITORIES = 4096
+
+_CACHE_LOCK = threading.RLock()
+_KNOWN_PATHS = None
+_SCAN_START_LOCK = threading.Lock()
+_SCAN_THREAD = None
+
+
+def _path_value(value):
     try:
-        roots.update(Path(p) for p in json.loads(registrations.read_text()).values())
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
-    roots.update(Path(p).expanduser() for p in os.environ.get("WORKTREE_BOARD_ROOTS", "").split(os.pathsep) if p)
-    return sorted(str(p.resolve()) for p in roots if (p / ".git").is_dir())
+        path = Path(os.path.expanduser(str(value)))
+    except (OSError, TypeError, ValueError):
+        return None
+    return path if path.is_absolute() else HOME / path
+
+
+def _canonical_repo(value):
+    """Return the primary checkout for a primary or linked worktree path."""
+    path = _path_value(value)
+    if path is None:
+        return None
+    try:
+        path = path.resolve()
+        git_path = path / ".git"
+        if git_path.is_dir():
+            return path
+        if not git_path.is_file():
+            return None
+        line = git_path.read_text(encoding="utf-8").strip()
+        if not line.lower().startswith("gitdir:"):
+            return None
+        gitdir = (git_path.parent / line.split(":", 1)[1].strip()).resolve()
+        commondir = gitdir / "commondir"
+        if commondir.is_file():
+            common_value = commondir.read_text(encoding="utf-8").strip()
+            common = (gitdir / common_value).resolve()
+        elif gitdir.parent.name == "worktrees":
+            common = gitdir.parent.parent.resolve()
+        else:
+            return None
+        if common.name != ".git" or not common.is_dir():
+            return None
+        root = common.parent
+        return root if (root / ".git").is_dir() else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _shallow_discover():
+    """Find repos in common homes without descending into them."""
+    candidates = set()
+    for relative in SHALLOW_HOMES:
+        base = HOME / relative
+        if not base.is_dir():
+            continue
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for candidate in (base, *entries):
+            root = _canonical_repo(candidate)
+            if root is not None:
+                candidates.add(root)
+    return candidates
+
+
+def _scan_home():
+    """Walk outside common homes in small slices, stopping at each repo."""
+    queue = deque([HOME])
+    volumes = Path("/Volumes")
+    if volumes.is_dir():
+        try:
+            for volume in volumes.iterdir():
+                try:
+                    resolved = volume.resolve()
+                except OSError:
+                    continue
+                if resolved != Path("/") and resolved.is_dir():
+                    queue.append(resolved)
+        except OSError:
+            pass
+    found = set()
+    while queue:
+        deadline = time.monotonic() + SCAN_SLICE_S
+        processed = 0
+        while queue and processed < SCAN_SLICE_DIRS and time.monotonic() < deadline:
+            current = queue.pop()
+            processed += 1
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+            if any(entry.name == ".git" for entry in entries):
+                root = _canonical_repo(current)
+                if root is not None:
+                    found.add(root)
+                    continue
+            for entry in entries:
+                if entry.name in SKIP_NAMES:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        queue.append(Path(entry.path))
+                except OSError:
+                    continue
+        if queue:
+            time.sleep(SCAN_PAUSE_S)
+    return found
+
+
+def _read_known_paths():
+    try:
+        data = json.loads(DISCOVERY_STATE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return set()
+    values = data.get("paths", []) if isinstance(data, dict) else data
+    if not isinstance(values, list):
+        return set()
+    return {
+        str(path)
+        for value in values
+        if isinstance(value, str) and (path := _path_value(value)) is not None
+    }
+
+
+def _write_known_paths(paths):
+    values = sorted(paths)[:MAX_CACHED_REPOSITORIES]
+    directory = DISCOVERY_STATE.parent
+    temporary = directory / (DISCOVERY_STATE.name + ".tmp")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump({"paths": values}, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(DISCOVERY_STATE)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def _remember(paths):
+    global _KNOWN_PATHS
+    discovered = {
+        str(path.resolve())
+        for path in paths
+        if isinstance(path, Path)
+    }
+    with _CACHE_LOCK:
+        if _KNOWN_PATHS is None:
+            _KNOWN_PATHS = _read_known_paths()
+        merged = _KNOWN_PATHS | discovered
+        merged = set(sorted(merged)[:MAX_CACHED_REPOSITORIES])
+        changed = merged != _KNOWN_PATHS
+        _KNOWN_PATHS = merged
+        if changed:
+            _write_known_paths(merged)
+
+
+def _valid_roots():
+    with _CACHE_LOCK:
+        paths = set(_KNOWN_PATHS or ())
+    return {
+        root
+        for path in paths
+        if (root := _canonical_repo(path)) is not None
+    }
+
+
+def _scan_loop():
+    while True:
+        try:
+            _remember(_scan_home())
+        except Exception:
+            pass
+        time.sleep(SCAN_INTERVAL_S)
+
+
+def _ensure_scan_thread():
+    global _SCAN_THREAD
+    with _SCAN_START_LOCK:
+        if _SCAN_THREAD is None or not _SCAN_THREAD.is_alive():
+            _SCAN_THREAD = threading.Thread(
+                target=_scan_loop,
+                daemon=True,
+                name="worktree-repository-discovery",
+            )
+            _SCAN_THREAD.start()
+
+
+def repo_roots():
+    """Return valid primary checkouts from shallow and durable discovery."""
+    _ensure_scan_thread()
+    shallow = _shallow_discover()
+    _remember(shallow)
+    roots = _valid_roots() | shallow
+    return sorted(str(root.resolve()) for root in roots if _canonical_repo(root) is not None)

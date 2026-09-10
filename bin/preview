@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -20,6 +21,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 from worktree_ports import ADMIN_PORT, OAUTH_PORT, RESERVED_PORTS, derive_port
+from project import detect
 
 GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
 OAUTH_REPOS = frozenset({"healthtree/one", "healthtree/next"})
@@ -68,14 +70,8 @@ def worktree_revision(path):
 
 
 def dev_command(path):
-    """This component's dev script, or None when it is not previewable."""
-    script = "admin:dev" if is_admin_app(path) else "dev"
-    try:
-        with open(os.path.join(_runtime_root(path), "package.json")) as f:
-            pkg = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return pkg.get("scripts", {}).get(script) or None
+    project = detect(_runtime_root(path), admin=is_admin_app(path))
+    return (project.get('script') or project['label']) if project else None
 
 
 def _host_platform():
@@ -104,6 +100,8 @@ def host_dependency_health(path):
         with open(package_path) as f:
             js_version = json.load(f).get("version")
     except (OSError, ValueError, AttributeError):
+        if "vite" not in (dev_command(path) or ""):
+            return {"ok": True}
         return {"ok": False, "error": f"host esbuild package missing at {package_path}",
                 "repair": repair}
     platform = _host_platform()
@@ -322,6 +320,16 @@ def _break_foreign_svelte_kit(path):
     os.unlink(svelte)
 
 
+def _available_command(argv, root):
+    """Use a repo's package manager without requiring a separate global install."""
+    if argv[0] in ('pnpm', 'yarn', 'bun') and not shutil.which(argv[0]):
+        package = json.loads((Path(root) / 'package.json').read_text())
+        pinned = package.get('packageManager', '')
+        name = pinned.split('+', 1)[0] if pinned.startswith(argv[0] + '@') else argv[0]
+        return ['npm', 'exec', '--yes', '--package', name, '--', *argv]
+    return argv
+
+
 def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=None):
     env = dict(os.environ)
     if path:
@@ -330,7 +338,7 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         defaults = {}
         primary = _primary_checkout(path)
         for root in dict.fromkeys(filter(None, (primary, _runtime_root(path)))):
-            for name in ('.env', '.env.development', '.env.local', '.env.development.local'):
+            for name in ('.env', '.env.local', '.env.development', '.env.development.local'):
                 file = Path(root) / name
                 if file.is_file():
                     text = file.read_text()
@@ -358,10 +366,11 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         env["VITE_FRONTEND_URL"] = f"http://localhost:{OAUTH_PORT}"
         if path:
             _inject_admin_algolia(env, path)
-    argv = ["npm", "run", "admin:dev" if path and is_admin_app(path) else "dev"]
-    if "vite" in dev:
+    project = detect(runtime_root, admin=is_admin_app(path))
+    argv = [arg.replace('{root}', runtime_root).replace('{port}', str(port)) for arg in project['argv']]
+    if project["kind"] == "node" and "vite" in dev:
         # vite itself ignores $PORT; needs the flag passed through npm's --
-        argv += ["--", "--port", str(port), "--strictPort"]
+        argv += (["--"] if argv[0] == "npm" else []) + ["--port", str(port), "--strictPort"]
         if runtime_root:
             # `vite [root]` is positional; --root is not a CLI flag.
             argv.append(runtime_root)
@@ -370,10 +379,14 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         if loopback_host:
             # Bind loopback directly; no relay process.
             argv += ["--host", loopback_host]
+    elif project["kind"] == "node" and "next dev" in dev:
+        argv += (["--"] if argv[0] == "npm" else []) + ["--port", str(port), "--hostname", loopback_host or "localhost"]
     elif loopback_host:
         # next dev and friends often honor HOST for the listen address.
         env["HOST"] = loopback_host
-    return argv, env
+    if project['kind'] == 'compose':
+        argv[2:2] = ['--project-name', _compose_name(path)]
+    return _available_command(argv, runtime_root), env
 
 
 def _ensure_ignored(path):
@@ -535,6 +548,41 @@ def served_revision(path):
     return _load_state().get(os.path.realpath(path), {}).get('revision', '')
 
 
+def _compose_name(path):
+    return 'worktree-checker-' + hashlib.sha256(_runtime_root(path).encode()).hexdigest()[:12]
+
+
+def _containers(record):
+    name = record.get('compose_project')
+    if not name:
+        return []
+    result = subprocess.run(['docker', 'ps', '-a', '--filter', f'label=com.docker.compose.project={name}',
+                             '--format', '{{.ID}}'], capture_output=True, text=True, timeout=10, check=True)
+    ids = result.stdout.split()
+    if not ids:
+        return []
+    result = subprocess.run(['docker', 'inspect', *ids], capture_output=True, text=True, timeout=10, check=True)
+    return [item for item in json.loads(result.stdout)
+            if item.get('Config', {}).get('Labels', {}).get('com.docker.compose.project') == name]
+
+
+def _container_ports(record):
+    return sorted({int(binding['HostPort']) for item in _containers(record) if item['State']['Running']
+                   for bindings in item['NetworkSettings'].get('Ports', {}).values()
+                   for binding in bindings or [] if binding.get('HostPort')})
+
+
+def _stop_containers(record):
+    ids = [item['Id'] for item in _containers(record)]
+    if ids:
+        subprocess.run(['docker', 'stop', '--time', '5', *ids], capture_output=True, timeout=30, check=True)
+        subprocess.run(['docker', 'rm', *ids], capture_output=True, timeout=15, check=True)
+
+
+def _record_ports(record, processes):
+    return _container_ports(record) if record.get('compose_project') else _owned_ports(_members(record, processes))
+
+
 def status(path):
     """Read only. Stop removes its record, so Stop cannot become a crash."""
     path = os.path.realpath(path)
@@ -542,8 +590,7 @@ def status(path):
     if not record:
         return dict(running=False, crashed=False, port=None, pid=None)
     members = _members(record, _processes()) if record.get('process') else []
-    listeners = _listeners(record['port']) if members else set()
-    running = bool(listeners) and listeners <= {p['pid'] for p in members}
+    running = record.get('port') in _record_ports(record, _processes())
     result = dict(running=running, crashed=not running and not (members and record.get('starting')), port=record.get('port'),
                   pid=record.get('process', {}).get('pid'))
     if not running:
@@ -562,6 +609,8 @@ def _stop(state, paths):
         if not record or not record.get('process'):
             continue
         try:
+            if record.get('compose_project'):
+                _stop_containers(record)
             _terminate(_members(record, _processes()), owned_group=True)
         except Exception as error:
             state[path] = dict(record, error=str(error))
@@ -599,7 +648,8 @@ def _launch(state, path, port):
     os.makedirs(_preview_dir(path), exist_ok=True)
     _ensure_ignored(path)
     _break_foreign_svelte_kit(path)
-    overlay = _write_vite_overlay(path, local_admin_bootstrap=is_admin_app(path)) if 'vite' in dev else None
+    project = detect(_runtime_root(path), admin=is_admin_app(path))
+    overlay = _write_vite_overlay(path, local_admin_bootstrap=is_admin_app(path)) if project['kind'] == 'node' and 'vite' in dev else None
     argv, env = _build_argv_env(dev, port, loopback_host='localhost', path=path, vite_config=overlay)
     with open(os.path.join(_preview_dir(path), 'log'), 'wb') as log:
         child = subprocess.Popen(argv, cwd=_runtime_root(path), env=env, stdout=log,
@@ -612,21 +662,40 @@ def _launch(state, path, port):
     if not process:
         raise RuntimeError('The dev command exited during startup.')
     state[path] = dict(process=process, members=members, port=port, starting=True, revision=worktree_revision(path))
+    if project['kind'] == 'compose':
+        state[path]['compose_project'] = _compose_name(path)
     _save_state(state)
+
+
+def _owned_ports(members):
+    if not members:
+        return []
+    result = subprocess.run(['lsof', '-nP', '-a', '-p', ','.join(str(p['pid']) for p in members),
+                             '-iTCP', '-sTCP:LISTEN', '-Fn'], capture_output=True, text=True, timeout=5)
+    if result.returncode not in (0, 1):
+        raise RuntimeError('Could not inspect the preview listener.')
+    return sorted({int(line.rsplit(':', 1)[1]) for line in result.stdout.splitlines()
+                   if line.startswith('n') and line.rsplit(':', 1)[-1].isdigit()})
 
 
 def _wait_ready(state, path, deadline):
     record = state[path]
     while time.monotonic() < deadline:
         members = _members(record, _processes())
-        if not members:
+        if not members and not record.get('compose_project'):
             raise RuntimeError('The dev server exited during startup.')
         if record['members'] != members:
             record['members'] = members
             _save_state(state)
-        listener_ids = _listeners(record['port'])
-        if listener_ids and listener_ids <= {p['pid'] for p in members}:
-            if port_is_ready(record['port'], vite='vite' in dev_command(path)):
+        vite = 'vite' in dev_command(path)
+        ports = _record_ports(record, _processes())
+        if vite:
+            ports = [port for port in ports if port == record['port']]
+        else:
+            ports.sort(key=lambda port: port != record['port'])
+        for port in ports:
+            if port_is_ready(port, vite=vite):
+                record['port'] = port
                 record.pop('starting', None)
                 _save_state(state)
                 return
@@ -644,12 +713,31 @@ def _result(state, paths, already=False):
                 main=main, admin=admin, already_running=already)
 
 
+def _run_setup(argv, root, log_dir):
+    with (log_dir / 'log').open('ab') as log:
+        child = subprocess.Popen(_available_command(argv, root), cwd=root, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+        processes = _processes()
+        owned = [p for p in processes.values() if p['group'] == child.pid]
+        try:
+            if child.wait(timeout=600) != 0:
+                raise RuntimeError('Package setup failed. The setup log has the details.')
+        finally:
+            _terminate(owned, owned_group=True)
+            child.wait()
+
+
 def _prepare_dependencies(path):
     """Prepare once on Start. APFS clones share disk blocks, not writable files."""
     root = Path(_runtime_root(path))
     modules = root / 'node_modules'
     log_dir = Path(_preview_dir(path))
     log_dir.mkdir(parents=True, exist_ok=True)
+    project = detect(str(root), admin=is_admin_app(path))
+    if project['kind'] != 'node':
+        for command in project['setup']:
+            _run_setup([arg.replace('{root}', str(root)) for arg in command], root, log_dir)
+        return
     health = host_dependency_health(path)
     if modules.is_dir() and health['ok']:
         return
@@ -685,17 +773,7 @@ def _prepare_dependencies(path):
         argv = ['bun', 'install', '--frozen-lockfile']
     else:
         argv = ['npm', 'ci' if lock == 'package-lock.json' else 'install', '--no-audit', '--no-fund']
-    with (log_dir / 'log').open('wb') as log:
-        child = subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=log,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
-        processes = _processes()
-        owned = [p for p in processes.values() if p['group'] == child.pid]
-        try:
-            if child.wait(timeout=600) != 0:
-                raise RuntimeError('Package setup failed. The setup log has the details.')
-        finally:
-            _terminate(owned, owned_group=True)
-            child.wait()
+    _run_setup(argv, root, log_dir)
     if not host_dependency_health(path)['ok']:
         raise RuntimeError('Package setup did not finish correctly. Try Start again.')
 
@@ -705,10 +783,11 @@ def _start(state, paths, *, restart=False):
         if not os.path.isdir(_runtime_root(path)) or not dev_command(path):
             raise RuntimeError(f'No dev script exists for {_runtime_root(path)}.')
     _prepare_dependencies(paths[-1])
-    if not restart and all(state.get(p) and _members(state[p], _processes())
-                           and _listeners(state[p]['port']) <= {m['pid'] for m in _members(state[p], _processes())}
+    if not restart and all(state.get(p)
+                           and state[p]['port'] in _record_ports(state[p], _processes())
                            and port_is_ready(state[p]['port'], vite='vite' in dev_command(p)) for p in paths):
         return _result(state, paths, already=True)
+
     pair = len(paths) == 2
     ports = [ADMIN_PORT, OAUTH_PORT] if pair else [
         ADMIN_PORT if is_admin_app(paths[0]) else OAUTH_PORT if is_oauth_bound(paths[0]) else derive_port(paths[0])]

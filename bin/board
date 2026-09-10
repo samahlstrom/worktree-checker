@@ -28,7 +28,7 @@ import urllib.parse
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 AVATAR_PATH = os.path.join(os.path.dirname(BIN), "assets", "sam-pixel.png")
-PORT = 7777
+PORT = int(os.environ.get("WORKTREE_CHECKER_PORT", "7777"))
 LINEAR_ID_RE = re.compile(r"([A-Z]{2,10}-\d+)")
 
 # 90s TTL: gh pr list is ~1.7s per repo and we walk ~14 roots. A 90s window
@@ -1470,6 +1470,7 @@ tbody tr.is-crashed:hover td {{ background: #FCE8E8; }}
 }}
 .btn.start:hover {{ background: #333; border-color: #333; }}
 .action {{ white-space: nowrap; }}
+.action details {{ max-width: 28rem; white-space: normal; overflow-wrap: anywhere; margin-top: 0.4rem; color: var(--muted); }}
 .action .btn + .btn, .action .btn + a.btn, .action a.btn + .btn {{ margin-left: 0.35rem; }}
 .empty {{
   display: none;
@@ -1617,6 +1618,7 @@ document.addEventListener('click', async e => {{
       if (tab && !tab.closed) tab.close();
       btn.textContent = starting ? 'could not start — retry' : 'could not stop — retry';
       btn.title = error.message;
+      btn.closest('td')?.querySelector('details')?.remove();
       const detail = document.createElement('details');
       const summary = document.createElement('summary');
       summary.textContent = 'Show details';
@@ -1669,6 +1671,14 @@ def render_page():
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _local_request(self):
+        hosts = {f'localhost:{PORT}', f'127.0.0.1:{PORT}'}
+        origin = self.headers.get('Origin')
+        if self.headers.get('Host') not in hosts or (origin and origin not in {f'http://{host}' for host in hosts}):
+            self.send_error(403)
+            return False
+        return True
+
     def _send(self, body, status=200, content_type="text/html; charset=utf-8"):
         b = body.encode()
         self.send_response(status)
@@ -1696,6 +1706,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self._local_request():
+            return
         path, qs = self._query()
         if path == "/":
             self._send(render_page())
@@ -1716,6 +1728,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._local_request():
+            return
         try:
             self._post()
         except Exception as error:

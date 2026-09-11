@@ -190,14 +190,16 @@ def _python_command(root, requirements):
 
 
 def _python_setup(root, requirements):
-    if requirements is None or (root / ".venv/bin/python").is_file():
+    if (root / ".venv/bin/python").is_file():
         return []
-    relative = requirements.relative_to(root)
-    return [
-        ["python3", "-m", "venv", "{root}/.venv"],
-        ["{root}/.venv/bin/python", "-m", "pip", "install", "-r",
-         f"{{root}}/{relative}"],
-    ]
+    if requirements:
+        install = ["-r", f"{{root}}/{requirements.relative_to(root)}"]
+    elif (root / "pyproject.toml").is_file():
+        install = ["-e", "{root}"]
+    else:
+        return []
+    return [["python3", "-m", "venv", "{root}/.venv"],
+            ["{root}/.venv/bin/python", "-m", "pip", "install", *install]]
 
 
 def _django(root):

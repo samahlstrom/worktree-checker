@@ -21,4 +21,6 @@ if not project:
 if args.fix:
     with preview._transition():
         preview.doctor.prepare(args.path, project, preview._run_setup)
-print(json.dumps(preview.doctor.health(args.path) if project['kind'] == 'node' else {'ok': True, 'project': project['label']}))
+result = preview.doctor.health(args.path) if project['kind'] == 'node' else {'ok': True, 'project': project['label']}
+print(json.dumps(result))
+raise SystemExit(0 if result['ok'] else 1)

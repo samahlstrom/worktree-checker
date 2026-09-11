@@ -476,7 +476,7 @@ def _containers(record):
 def _container_ports(record):
     return sorted({int(binding['HostPort']) for item in _containers(record) if item['State']['Running']
                    for bindings in item['NetworkSettings'].get('Ports', {}).values()
-                   for binding in bindings or [] if binding.get('HostPort')})
+                   for binding in bindings or [] if str(binding.get('HostPort', '')).isdigit()})
 
 
 def _stop_containers(record):
@@ -569,6 +569,13 @@ def _launch(state, path, port):
     process = processes.get(child.pid) or next(iter(members), None)
     threading.Thread(target=child.wait, daemon=True).start()
     if not process:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2)
         raise RuntimeError('The dev command exited during startup.')
     state[path] = dict(process=process, members=members, port=port, starting=True, revision=worktree_revision(path))
     if project['kind'] == 'compose':
@@ -591,7 +598,7 @@ def _wait_ready(state, path, deadline):
     record = state[path]
     while time.monotonic() < deadline:
         members = _members(record, _processes())
-        if not members and not record.get('compose_project'):
+        if not members and (not record.get('compose_project') or not _container_ports(record)):
             raise RuntimeError('The dev server exited during startup.')
         if record['members'] != members:
             record['members'] = members
@@ -632,8 +639,14 @@ def _run_setup(argv, root, log_dir):
             if child.wait(timeout=600) != 0:
                 raise RuntimeError('Package setup failed. The setup log has the details.')
         finally:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2)
             _terminate(owned, owned_group=True)
-            child.wait()
 
 
 def _start(state, paths, *, restart=False):

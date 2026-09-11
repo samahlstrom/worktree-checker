@@ -46,8 +46,11 @@ def health(root):
     if not modules.is_dir() or modules.is_symlink():
         return {'ok': False, 'error': 'Packages need setup.'}
     check = Path(__file__).with_name('dep-health.sh')
-    result = subprocess.run(['/bin/bash', '-c', 'source "$1"; modules_are_healthy "$2"',
-                             '--', str(check), str(modules)], capture_output=True, timeout=30)
+    try:
+        result = subprocess.run(['/bin/bash', '-c', 'source "$1"; modules_are_healthy "$2"',
+                                 '--', str(check), str(modules)], capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': 'Package check timed out.'}
     return {'ok': result.returncode == 0, 'error': 'Packages need repair.' if result.returncode else ''}
 
 

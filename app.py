@@ -11,7 +11,7 @@ import urllib.request
 import webbrowser
 
 ROOT = Path(__file__).resolve().parent
-URL = 'http://127.0.0.1:7777'
+URL = 'http://127.0.0.1:' + os.environ.get('WORKTREE_CHECKER_PORT', '7777')
 LABEL = 'local.worktree-checker'
 
 
@@ -43,6 +43,12 @@ def install_login_service():
 
 
 def main():
+    if sys.stdout is None or sys.stderr is None:
+        logs = Path.home() / '.local/state/worktree-preview-board'
+        logs.mkdir(parents=True, exist_ok=True)
+        stream = (logs / 'board.log').open('a', buffering=1)
+        sys.stdout = sys.stdout or stream
+        sys.stderr = sys.stderr or stream
     configure_path()
     if '--doctor' in sys.argv:
         sys.argv = [str(ROOT / 'bin/worktree-doctor'), *sys.argv[sys.argv.index('--doctor') + 1:]]

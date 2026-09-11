@@ -58,15 +58,16 @@ class ProjectDetectionTests(unittest.TestCase):
                 "scripts": {
                     "dev": "node web.js",
                     "api:dev": "node api.js",
+                    "api:emulator": "node api-emulator.js",
                     "dev:watch": "node watch.js",
                     "api:test": "node test.js",
                 },
             }))
             services = project.detect_services(str(root))
-            self.assertEqual([service["service"] for service in services], ["dev", "api:dev"])
+            self.assertEqual([service["service"] for service in services], ["dev", "api:emulator"])
             self.assertEqual([service["service_label"] for service in services], ["dev", "api"])
-            self.assertEqual(services[1]["argv"], ["npm", "run", "api:dev"])
-            self.assertEqual(services[1]["script"], "node api.js")
+            self.assertEqual(services[1]["argv"], ["npm", "run", "api:emulator"])
+            self.assertEqual(services[1]["script"], "node api-emulator.js")
 
     def test_namespaced_dev_script_can_be_the_only_service(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -78,6 +79,17 @@ class ProjectDetectionTests(unittest.TestCase):
             self.assertEqual(len(services), 1)
             self.assertEqual(services[0]["service_label"], "docs")
             self.assertIsNone(project.detect(str(root)))
+
+    def test_namespaced_emulator_script_can_be_the_only_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "package.json", json.dumps({
+                "scripts": {"docs:emulator": "python3 -m http.server"},
+            }))
+            services = project.detect_services(str(root))
+            self.assertEqual(len(services), 1)
+            self.assertEqual(services[0]["service"], "docs:emulator")
+            self.assertEqual(services[0]["service_label"], "docs")
 
     def test_node_defaults_to_npm_without_a_lockfile(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -37,6 +37,18 @@ class PreviewLifecycleTests(unittest.TestCase):
             argv, _ = preview._build_argv_env('node api.js', 43210, path=component)
             self.assertEqual(argv, ['npm', 'run', 'api:dev'])
 
+    def test_emulator_service_receives_generic_and_named_ports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'package.json').write_text(json.dumps({
+                'scripts': {'api:dev': 'node api.js', 'api:emulator': 'node emulator.js'},
+            }))
+            component = preview.service_definitions(root)[0]['path']
+            argv, env = preview._build_argv_env('node emulator.js', 43210, path=component)
+            self.assertEqual(argv, ['npm', 'run', 'api:emulator'])
+            self.assertEqual(env['PORT'], '43210')
+            self.assertEqual(env['API_PORT'], '43210')
+
     def test_stop_is_repeatable_and_publishes_stop_before_signaling(self):
         record = {'process': {'pid': 123}, 'port': 43123}
         state = {'/tree': record}
@@ -73,6 +85,15 @@ class PreviewLifecycleTests(unittest.TestCase):
         saved = dict(pid=123, group=123, uid=501, birth='old')
         current = dict(saved, birth='new')
         self.assertEqual(preview._members({'process': saved}, {123: current}), [])
+
+    def test_members_include_descendants_that_create_a_new_process_group(self):
+        root = dict(pid=123, parent=1, group=123, uid=501, birth='root')
+        child = dict(pid=456, parent=123, group=456, uid=501, birth='child')
+        grandchild = dict(pid=789, parent=456, group=456, uid=501, birth='grandchild')
+        members = preview._members({'process': root}, {
+            process['pid']: process for process in (root, child, grandchild)
+        })
+        self.assertEqual([process['pid'] for process in members], [123, 456, 789])
 
     def test_missing_dependencies_leave_current_preview_untouched(self):
         with patch.object(preview.os.path, 'isdir', return_value=True), \

@@ -32,8 +32,9 @@ may require approval in **System Settings → Privacy & Security → Open Anyway
 ## Previews
 
 - Start uses the repository's own development command when one is present.
-- Node projects may declare additional local services with `<name>:dev` package scripts. The board
-  discovers each service and gives it an independent Start, Open, and Stop control.
+- Node projects may declare additional local services with `<name>:dev` package scripts. A matching
+  `<name>:emulator` takes precedence for seeded local development. The board passes its allocated
+  port as both `PORT` and `<NAME>_PORT`, then gives each service independent controls.
 - Start calls **Worktree Doctor** to repair missing packages, broken generated-file links, and missing ignored local settings. Compatible existing installs can
   be cloned on APFS without sharing writable dependency files.
 - Existing local environment files supply configuration; nothing is uploaded.

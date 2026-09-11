@@ -98,7 +98,8 @@ def _node(root, script_name=None):
         setup,
         script=scripts[script_name].strip(),
         service=script_name,
-        service_label=script_name[:-4] if script_name.endswith(":dev") else script_name,
+        service_label=(script_name.rsplit(":", 1)[0]
+                       if script_name.endswith((":dev", ":emulator")) else script_name),
     )
 
 
@@ -483,7 +484,9 @@ def detect_services(root: str):
     """Return each independently runnable service declared by the project.
 
     Node projects may name additional services with ``<name>:dev`` scripts.
-    Other project types keep the single command returned by ``detect``.
+    A matching ``<name>:emulator`` takes precedence so local previews use the
+    repository's seeded environment. Other project types keep the single
+    command returned by ``detect``.
     """
     root = _root_path(root)
     if root is None:
@@ -499,11 +502,13 @@ def detect_services(root: str):
         )
         if primary:
             names.append(primary)
-        names.extend(sorted(
-            name for name, command in scripts.items()
-            if isinstance(name, str) and name.endswith(":dev") and name[:-4]
-            and isinstance(command, str) and command.strip()
-        ))
+        named = {}
+        for suffix in (":dev", ":emulator"):
+            for name, command in scripts.items():
+                if (isinstance(name, str) and name.endswith(suffix) and name[:-len(suffix)]
+                        and isinstance(command, str) and command.strip()):
+                    named[name[:-len(suffix)]] = name
+        names.extend(named[label] for label in sorted(named))
         services = [_node(root, name) for name in dict.fromkeys(names)]
         if services:
             return services
@@ -514,6 +519,7 @@ def detect_services(root: str):
 def detect_service(root: str, service: str):
     """Return one discovered service by its repository-authored name."""
     root = _root_path(root)
-    if root is None or not service.endswith(":dev") or not service[:-4]:
+    if (root is None or not service.endswith((":dev", ":emulator"))
+            or not service.rsplit(":", 1)[0]):
         return None
     return _node(root, service)

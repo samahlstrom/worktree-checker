@@ -27,6 +27,7 @@ import worktree_doctor as doctor
 GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
 LOG_TAIL_LINES = 8
 READY_TIMEOUT = 60
+EMULATOR_READY_TIMEOUT = 300
 SERVICE_STATE_DIR = os.path.join('.preview', 'services')
 
 
@@ -197,6 +198,11 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         # would then resolve that other checkout.
         env["PWD"] = runtime_root
     project = _project(path)
+    service = project.get('service')
+    if service and service.endswith(':emulator'):
+        label = re.sub(r'[^A-Za-z0-9]+', '_', service.rsplit(':', 1)[0]).strip('_').upper()
+        if label:
+            env[f'{label}_PORT'] = str(port)
     argv = [arg.replace('{root}', runtime_root).replace('{port}', str(port)) for arg in project['argv']]
     if project["kind"] == "node" and "vite" in dev:
         # vite itself ignores $PORT; needs the flag passed through npm's --
@@ -314,10 +320,17 @@ def _matches(saved, current):
 
 def _members(record, processes):
     anchors = record.get('members', []) + [record.get('process', {})]
-    if not any(_matches(p, processes.get(p.get('pid'))) for p in anchors):
+    known = {saved['pid']: processes[saved['pid']] for saved in anchors
+             if _matches(saved, processes.get(saved.get('pid')))}
+    if not known:
         return []
-    group = record['process']['group']
-    return [p for p in processes.values() if p['group'] == group]
+    while True:
+        children = {pid: process for pid, process in processes.items()
+                    if pid not in known and process['parent'] in known}
+        if not children:
+            break
+        known.update(children)
+    return [process for pid, process in processes.items() if pid in known]
 
 
 def _listeners(port):
@@ -516,7 +529,7 @@ def _wait_ready(state, path, deadline):
                 _save_state(state)
                 return
         time.sleep(.25)
-    raise RuntimeError('The dev server did not start within 60 seconds.')
+    raise RuntimeError('The dev server did not start within its startup time limit.')
 
 
 def _result(state, paths, already=False):
@@ -560,7 +573,9 @@ def _start(state, paths, *, restart=False):
         while _listeners(port) or port in ports:
             port += 1
         ports.append(port)
-    deadline = time.monotonic() + READY_TIMEOUT
+    timeout = max(EMULATOR_READY_TIMEOUT if (_project(path).get('service') or '').endswith(':emulator')
+                  else READY_TIMEOUT for path in paths)
+    deadline = time.monotonic() + timeout
     path = paths[0]
     try:
         for path, port in zip(paths, ports):

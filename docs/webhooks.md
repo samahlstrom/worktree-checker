@@ -39,7 +39,8 @@ startup and every 60 seconds. A webhook only wakes that scan; Worktree Checker
 still fetches GitHub state before it retires anything. The `gh` CLI must be
 installed and authenticated for cleanup. If it is missing or cannot read the
 repository, the local board continues to work, the worktree stays in place,
-and `/health` reports the failed scan.
+and `http://127.0.0.1:7777/health` reports the failed scan. This status page is
+available even when the optional webhook listener is disabled.
 
 The match requires the exact repository and exact PR head branch. The newest PR
 for that branch wins, so do not reuse a branch for a new delivery after its old

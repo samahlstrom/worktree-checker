@@ -21,7 +21,8 @@ Or download the macOS ZIP for your Mac from [Releases](https://github.com/samahl
 Unzip, move **Worktree Checker.app** to Applications, and open it. The board opens at
 <http://127.0.0.1:7777> and starts at login thereafter.
 
-The app includes Python and Node/npm. macOS releases are currently unsigned; macOS
+The app includes Python for the board and Node/npm for JavaScript projects. Other
+project stacks need their own runtime installed. macOS releases are currently unsigned; macOS
 may require approval in **System Settings → Privacy & Security → Open Anyway**.
 
 ## Previews

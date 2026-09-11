@@ -49,6 +49,12 @@ class PreviewLifecycleTests(unittest.TestCase):
             self.assertEqual(env['PORT'], '43210')
             self.assertEqual(env['API_PORT'], '43210')
 
+    def test_emulator_does_not_publish_an_auxiliary_listener_as_its_app_url(self):
+        ports = preview.readiness_ports(
+            {'service': 'api:emulator'}, 'node emulator.js', 43210, [43211, 43210]
+        )
+        self.assertEqual(ports, [43210])
+
     def test_stop_is_repeatable_and_publishes_stop_before_signaling(self):
         record = {'process': {'pid': 123}, 'port': 43123}
         state = {'/tree': record}

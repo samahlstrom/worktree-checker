@@ -507,6 +507,13 @@ def _owned_ports(members):
                    if line.startswith('n') and line.rsplit(':', 1)[-1].isdigit()})
 
 
+def readiness_ports(project, dev, expected, ports):
+    """Only publish the app port for commands that own auxiliary listeners."""
+    if 'vite' in dev or (project.get('service') or '').endswith(':emulator'):
+        return [port for port in ports if port == expected]
+    return sorted(ports, key=lambda port: port != expected)
+
+
 def _wait_ready(state, path, deadline):
     record = state[path]
     while time.monotonic() < deadline:
@@ -516,12 +523,10 @@ def _wait_ready(state, path, deadline):
         if record['members'] != members:
             record['members'] = members
             _save_state(state)
-        vite = 'vite' in dev_command(path)
-        ports = _record_ports(record, _processes())
-        if vite:
-            ports = [port for port in ports if port == record['port']]
-        else:
-            ports.sort(key=lambda port: port != record['port'])
+        project = _project(path)
+        dev = dev_command(path)
+        vite = 'vite' in dev
+        ports = readiness_ports(project, dev, record['port'], _record_ports(record, _processes()))
         for port in ports:
             if port_is_ready(port, vite=vite):
                 record['port'] = port

@@ -49,18 +49,21 @@ def _package(root):
     return data if isinstance(data, dict) else None
 
 
-def _node(root):
+def _node(root, script_name=None):
     package = _package(root)
     if package is None:
         return None
     scripts = package.get("scripts")
     if not isinstance(scripts, dict):
         return None
-    script_name = next(
-        (name for name in ("dev", "start")
-         if isinstance(scripts.get(name), str) and scripts[name].strip()),
-        None,
-    )
+    if script_name is None:
+        script_name = next(
+            (name for name in ("dev", "start")
+             if isinstance(scripts.get(name), str) and scripts[name].strip()),
+            None,
+        )
+    elif not isinstance(scripts.get(script_name), str) or not scripts[script_name].strip():
+        return None
     if not script_name:
         return None
     locked_manager = next((manager for filename, manager in _LOCKFILES
@@ -94,6 +97,8 @@ def _node(root):
         "node",
         setup,
         script=scripts[script_name].strip(),
+        service=script_name,
+        service_label=script_name[:-4] if script_name.endswith(":dev") else script_name,
     )
 
 
@@ -472,3 +477,43 @@ def detect(root: str):
         if result is not None:
             return result
     return None
+
+
+def detect_services(root: str):
+    """Return each independently runnable service declared by the project.
+
+    Node projects may name additional services with ``<name>:dev`` scripts.
+    Other project types keep the single command returned by ``detect``.
+    """
+    root = _root_path(root)
+    if root is None:
+        return []
+    package = _package(root)
+    scripts = package.get("scripts") if package else None
+    if isinstance(scripts, dict):
+        names = []
+        primary = next(
+            (name for name in ("dev", "start")
+             if isinstance(scripts.get(name), str) and scripts[name].strip()),
+            None,
+        )
+        if primary:
+            names.append(primary)
+        names.extend(sorted(
+            name for name, command in scripts.items()
+            if isinstance(name, str) and name.endswith(":dev") and name[:-4]
+            and isinstance(command, str) and command.strip()
+        ))
+        services = [_node(root, name) for name in dict.fromkeys(names)]
+        if services:
+            return services
+    project = detect(root)
+    return [project] if project else []
+
+
+def detect_service(root: str, service: str):
+    """Return one discovered service by its repository-authored name."""
+    root = _root_path(root)
+    if root is None or not service.endswith(":dev") or not service[:-4]:
+        return None
+    return _node(root, service)

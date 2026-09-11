@@ -54,6 +54,45 @@ class BoardControlTests(unittest.TestCase):
         self.assertIn('>open</a>', rendered)
         self._assert_no_app_specific_output(rendered)
 
+    def test_multi_service_row_has_independent_generic_controls(self):
+        row = self._row(running=True)
+        row['services'] = [
+            {
+                'name': 'dev', 'path': row['path'], 'running': True,
+                'crashed': False, 'port': 43123, 'message': '', 'log_tail': '',
+                'served_revision': 'abc123',
+            },
+            {
+                'name': 'api', 'path': row['path'] + '/.preview/services/api%3Adev',
+                'running': False, 'crashed': False, 'port': None,
+                'message': '', 'log_tail': '', 'served_revision': '',
+            },
+        ]
+        rendered = board._row_html(row)
+        self.assertIn('open dev :43123', rendered)
+        self.assertIn('stop dev', rendered)
+        self.assertIn('start api', rendered)
+        self.assertNotIn('stop api', rendered)
+        self._assert_no_app_specific_output(rendered)
+
+    def test_multi_service_running_banner_names_each_service(self):
+        row = self._row(running=True)
+        row['services'] = [
+            {
+                'name': 'dev', 'path': row['path'], 'running': True,
+                'crashed': False, 'port': 43123,
+            },
+            {
+                'name': 'api', 'path': row['path'] + '/.preview/services/api%3Adev',
+                'running': True, 'crashed': False, 'port': 43124,
+            },
+        ]
+        rendered = board._running_banner([row])
+        self.assertIn('feature-widget / dev', rendered)
+        self.assertIn('feature-widget / api', rendered)
+        self.assertEqual(rendered.count('class="btn stop"'), 2)
+        self._assert_no_app_specific_output(rendered)
+
     def test_saved_path_without_a_server_definition_is_stopped(self):
         with patch.object(board.preview, "_load_state", return_value={"/old-tree": {}}), \
              patch.object(board.preview, "dev_command", return_value=None), \

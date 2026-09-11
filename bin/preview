@@ -16,27 +16,68 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 from worktree_ports import derive_port
-from project import detect
+from project import detect, detect_service, detect_services
 import worktree_doctor as doctor
 
 GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
 LOG_TAIL_LINES = 8
 READY_TIMEOUT = 60
+SERVICE_STATE_DIR = os.path.join('.preview', 'services')
+
+
+def _service_name(path):
+    """Repository script name encoded in a synthetic service state path."""
+    path = Path(os.path.realpath(path))
+    if (path / '.git').exists():
+        return None
+    if path.parent.name != 'services' or path.parent.parent.name != '.preview':
+        return None
+    return urllib.parse.unquote(path.name)
+
+
+def _service_path(root, service):
+    encoded = urllib.parse.quote(service, safe='')
+    return os.path.join(os.path.realpath(root), SERVICE_STATE_DIR, encoded)
 
 
 def _runtime_root(path):
     """Directory from which this component's dev process must run."""
     path = os.path.realpath(path)
-    return path
+    return str(Path(path).parents[2]) if _service_name(path) is not None else path
 
 
 def _preview_dir(path):
     path = os.path.realpath(path)
-    return os.path.join(path, ".preview")
+    return path if _service_name(path) is not None else os.path.join(path, ".preview")
+
+
+def _project(path):
+    root = _runtime_root(path)
+    service = _service_name(path)
+    return detect_service(root, service) if service is not None else detect(root)
+
+
+def service_definitions(path):
+    """Discovered services and their independent runtime state paths."""
+    root = _runtime_root(path)
+    primary = detect(root)
+    definitions = []
+    for project in detect_services(root):
+        service = project.get('service')
+        component = (
+            root if primary and service == primary.get('service')
+            else _service_path(root, service)
+        )
+        definitions.append({
+            'name': project.get('service_label') or project['label'],
+            'path': component,
+        })
+    return definitions
 
 
 def worktree_revision(path):
@@ -52,7 +93,7 @@ def worktree_revision(path):
 
 
 def dev_command(path):
-    project = detect(_runtime_root(path))
+    project = _project(path)
     return (project.get('script') or project['label']) if project else None
 
 
@@ -155,7 +196,7 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         # process was started from another checkout). Tools that read PWD
         # would then resolve that other checkout.
         env["PWD"] = runtime_root
-    project = detect(runtime_root)
+    project = _project(path)
     argv = [arg.replace('{root}', runtime_root).replace('{port}', str(port)) for arg in project['argv']]
     if project["kind"] == "node" and "vite" in dev:
         # vite itself ignores $PORT; needs the flag passed through npm's --
@@ -416,7 +457,7 @@ def _launch(state, path, port):
     dev = dev_command(path)
     os.makedirs(_preview_dir(path), exist_ok=True)
     _ensure_ignored(path)
-    project = detect(_runtime_root(path))
+    project = _project(path)
     overlay = _write_vite_overlay(path) if project['kind'] == 'node' and 'vite' in dev else None
     argv, env = _build_argv_env(dev, port, loopback_host='localhost', path=path, vite_config=overlay)
     with open(os.path.join(_preview_dir(path), 'log'), 'wb') as log:
@@ -511,7 +552,7 @@ def _start(state, paths, *, restart=False):
                            and port_is_ready(state[p]['port'], vite='vite' in dev_command(p)) for p in paths):
         return _result(state, paths, already=True)
 
-    doctor.prepare(_runtime_root(paths[-1]), detect(_runtime_root(paths[-1])), _run_setup)
+    doctor.prepare(_runtime_root(paths[-1]), _project(paths[-1]), _run_setup)
     _stop(state, paths)
     ports = []
     for path in paths:

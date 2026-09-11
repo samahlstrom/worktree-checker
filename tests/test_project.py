@@ -51,6 +51,34 @@ class ProjectDetectionTests(unittest.TestCase):
             self.assertEqual(result["argv"], ["npm", "run", "dev"])
             self.assertEqual(result["script"], "node server.js")
 
+    def test_node_services_include_generic_namespaced_dev_scripts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "package.json", json.dumps({
+                "scripts": {
+                    "dev": "node web.js",
+                    "api:dev": "node api.js",
+                    "dev:watch": "node watch.js",
+                    "api:test": "node test.js",
+                },
+            }))
+            services = project.detect_services(str(root))
+            self.assertEqual([service["service"] for service in services], ["dev", "api:dev"])
+            self.assertEqual([service["service_label"] for service in services], ["dev", "api"])
+            self.assertEqual(services[1]["argv"], ["npm", "run", "api:dev"])
+            self.assertEqual(services[1]["script"], "node api.js")
+
+    def test_namespaced_dev_script_can_be_the_only_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "package.json", json.dumps({
+                "scripts": {"docs:dev": "python3 -m http.server"},
+            }))
+            services = project.detect_services(str(root))
+            self.assertEqual(len(services), 1)
+            self.assertEqual(services[0]["service_label"], "docs")
+            self.assertIsNone(project.detect(str(root)))
+
     def test_node_defaults_to_npm_without_a_lockfile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2,6 +2,8 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import json
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +14,29 @@ loader.exec_module(preview)
 
 
 class PreviewLifecycleTests(unittest.TestCase):
+    def test_namespaced_node_services_get_independent_component_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'package.json').write_text(json.dumps({
+                'scripts': {'dev': 'node web.js', 'api:dev': 'node api.js'},
+            }))
+            services = preview.service_definitions(root)
+            self.assertEqual([service['name'] for service in services], ['dev', 'api'])
+            self.assertEqual(services[0]['path'], str(root.resolve()))
+            self.assertIn('/.preview/services/api%3Adev', services[1]['path'])
+            self.assertEqual(preview._runtime_root(services[1]['path']), str(root.resolve()))
+            self.assertEqual(preview.dev_command(services[1]['path']), 'node api.js')
+
+    def test_namespaced_service_builds_its_own_package_script_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'package.json').write_text(json.dumps({
+                'scripts': {'dev': 'node web.js', 'api:dev': 'node api.js'},
+            }))
+            component = preview.service_definitions(root)[1]['path']
+            argv, _ = preview._build_argv_env('node api.js', 43210, path=component)
+            self.assertEqual(argv, ['npm', 'run', 'api:dev'])
+
     def test_stop_is_repeatable_and_publishes_stop_before_signaling(self):
         record = {'process': {'pid': 123}, 'port': 43123}
         state = {'/tree': record}

@@ -295,13 +295,32 @@ def _pr_fields(pr):
     }
 
 
+def _service_states(path):
+    services = []
+    for definition in preview.service_definitions(path):
+        state = preview.status(definition['path'])
+        running = state['running']
+        services.append({
+            **definition,
+            'running': running,
+            'crashed': bool(state.get('crashed')),
+            'port': state.get('port'),
+            'message': state.get('message') or '',
+            'log_tail': state.get('log_tail') or '',
+            'served_revision': (
+                preview.served_revision(definition['path']) if running else ''
+            ),
+        })
+    return services
+
+
 def build_rows():
     """One row per linked worktree across every discovered repo, newest commit
     first. Repos with no dev server still appear -- branch, PR,
     and state stay useful even when start is unavailable.
 
-    A worktree is startable only when package.json has scripts.dev. Non-
-    startable rows never get a Start button; they keep a reveal affordance
+    A worktree is startable when project detection finds at least one service.
+    Non-startable rows never get a Start button; they keep a reveal affordance
     so the user can open the folder.
 
     PR data is joined on branch name after one cached `gh pr list` per repo
@@ -329,15 +348,17 @@ def build_rows():
         owner, project = identity_by_repo[repo_root]
         for entry in entries:
             path = entry["path"]
-            startable = preview.dev_command(path) is not None
+            services = _service_states(path)
+            startable = bool(services)
             # Non-startable trees never run a preview; skip pid/port IO.
             if startable:
-                st = preview.status(path)
-                running, port = st["running"], st["port"]
-                crashed = bool(st.get("crashed"))
-                log_tail = st.get("log_tail") or ""
-                status_message = st.get("message") or ""
-                served_revision = preview.served_revision(path) if running else ""
+                running = any(service['running'] for service in services)
+                crashed = any(service['crashed'] for service in services)
+                summary = services[0]
+                port = summary['port']
+                log_tail = summary['log_tail']
+                status_message = summary['message']
+                served_revision = summary['served_revision']
             else:
                 running, port = False, None
                 crashed, log_tail, status_message, served_revision = False, "", "", ""
@@ -363,6 +384,7 @@ def build_rows():
                 "startable": startable,
                 "head": head,
                 "served_revision": served_revision,
+                "services": services,
             }
             row.update(_pr_fields(pr))
             rows.append(row)
@@ -443,8 +465,14 @@ def fingerprint():
     parts = []
     for root in _cached_repo_roots():
         parts.append((root, _admin_dir_signature(root)))
-        parts.extend((path, os.path.isdir(path), os.path.isfile(os.path.join(path, 'package.json')))
-                     for path in _cached_worktree_paths(root))
+        for path in _cached_worktree_paths(root):
+            package = os.path.join(path, 'package.json')
+            try:
+                package_stat = os.stat(package)
+                package_signature = (package_stat.st_mtime_ns, package_stat.st_size)
+            except OSError:
+                package_signature = None
+            parts.append((path, os.path.isdir(path), package_signature))
     state = preview._load_state()
     processes = preview._processes() if state else {}
     parts.append([(path, record, bool(preview._members(record, processes)))
@@ -475,6 +503,7 @@ def _search_blob(row):
         parts.append("not startable")
     if row.get("crashed"):
         parts.append("crashed")
+    parts.extend(service.get('name') or '' for service in row.get('services', []))
     return " ".join(parts).lower()
 
 
@@ -486,21 +515,24 @@ def refresh_running_previews(now=None):
             preview.stop(path)
     for repo_root in _cached_repo_roots():
         for path in _cached_worktree_paths(repo_root):
-            if not os.path.isdir(path) or preview.dev_command(path) is None:
+            if not os.path.isdir(path):
                 continue
-            running = preview.status(path)
-            current = preview.worktree_revision(path)
-            if not running.get("running") or not current or preview.served_revision(path) == current:
-                _REVISION_PENDING.pop(path, None)
-                continue
-            pending = _REVISION_PENDING.get(path)
-            if pending is None or pending[0] != current:
-                _REVISION_PENDING[path] = (current, now)
-                continue
-            if now - pending[1] >= REVISION_DEBOUNCE_S:
-                result = preview.restart(path, expected_revision=current)
-                if result.get("ok"):
-                    _REVISION_PENDING.pop(path, None)
+            for service in preview.service_definitions(path):
+                component = service['path']
+                running = preview.status(component)
+                current = preview.worktree_revision(component)
+                if (not running.get("running") or not current
+                        or preview.served_revision(component) == current):
+                    _REVISION_PENDING.pop(component, None)
+                    continue
+                pending = _REVISION_PENDING.get(component)
+                if pending is None or pending[0] != current:
+                    _REVISION_PENDING[component] = (current, now)
+                    continue
+                if now - pending[1] >= REVISION_DEBOUNCE_S:
+                    result = preview.restart(component, expected_revision=current)
+                    if result.get("ok"):
+                        _REVISION_PENDING.pop(component, None)
 
 
 def _revision_watcher():
@@ -532,15 +564,18 @@ def _running_banner(rows):
     """Show each running preview with its URL and Stop control."""
     items = []
     for row in rows:
-        if not row.get("running"):
-            continue
-        path = html.escape(urllib.parse.quote(row["path"]), quote=True)
-        items.append(
-            f'<span class="live-item"><a class="live-link" href="http://localhost:{row["port"]}/" '
-            f'target="_blank" rel="noopener">{html.escape(row["name"])}'
-            f'<span class="live-port">:{row["port"]}</span></a>'
-            f'<button class="btn stop" data-path="{path}">stop</button></span>'
-        )
+        services = _row_services(row)
+        for service in services:
+            if not service.get('running'):
+                continue
+            path = html.escape(urllib.parse.quote(service['path']), quote=True)
+            label = row['name'] if len(services) == 1 else f"{row['name']} / {service['name']}"
+            items.append(
+                f'<span class="live-item"><a class="live-link" '
+                f'href="http://localhost:{service["port"]}/" target="_blank" rel="noopener">'
+                f'{html.escape(label)}<span class="live-port">:{service["port"]}</span></a>'
+                f'<button class="btn stop" data-path="{path}">stop</button></span>'
+            )
     if not items:
         return ""
     return ('<div class="live-bar"><span class="live-dot">●</span>'
@@ -571,8 +606,10 @@ def copy_payload(row):
         lines.append(pr)
     if row.get("path"):
         lines.append(f"path: {row['path']}")
-    if row.get("running") and row.get("port"):
-        lines.append(f"serving: http://localhost:{row['port']}/")
+    services = [service for service in _row_services(row) if service.get('running')]
+    for service in services:
+        label = f" {service['name']}" if len(row.get('services', [])) > 1 else ''
+        lines.append(f"serving{label}: http://localhost:{service['port']}/")
     return "\n".join(lines)
 
 
@@ -584,9 +621,9 @@ def _copy_button(row):
             f'title="Copy this card&#39;s details to paste into chat">copy</button>')
 
 
-def _served_identity(row):
+def _served_identity(row, service=None):
     """Visible proof of the exact worktree revision a live process serves."""
-    revision = row.get("served_revision") or ""
+    revision = (service or row).get("served_revision") or ""
     if not revision:
         return ""
     head = row.get("head") or ""
@@ -594,7 +631,62 @@ def _served_identity(row):
     label = f"stale {revision[:8]} → {head[:8]}" if stale else f"served {revision[:8]}"
     title = f"Serving {row.get('path') or ''} at {revision}"
     return (f' <span class="{"crashed" if stale else "shared"}" '
-            f'title="{html.escape(title, quote=True)}">{html.escape(label)}</span>')
+           f'title="{html.escape(title, quote=True)}">{html.escape(label)}</span>')
+
+
+def _row_services(row):
+    if row.get('services'):
+        return row['services']
+    return [{
+        'name': '', 'path': row['path'], 'running': row.get('running'),
+        'crashed': row.get('crashed'), 'port': row.get('port'),
+        'message': row.get('message') or '', 'log_tail': row.get('log_tail') or '',
+        'served_revision': row.get('served_revision') or '',
+    }]
+
+
+def _multi_service_cells(row, services):
+    status_bits = []
+    action_bits = []
+    worktree_name = row.get('name') or ''
+    for service in services:
+        name = html.escape(service['name'])
+        path = html.escape(urllib.parse.quote(service['path']), quote=True)
+        if service.get('running'):
+            state = (f'<span class="running">● running :{service["port"]}</span>'
+                     f'{_served_identity(row, service)}')
+            action = (
+                f'<a class="btn open" href="http://localhost:{service["port"]}/" '
+                f'target="_blank">open {name} :{service["port"]}</a> '
+                f'<button class="btn stop" data-path="{path}">stop {name}</button>'
+            )
+        elif service.get('crashed'):
+            port = f" :{service['port']}" if service.get('port') else ''
+            state = f'<span class="crashed">✕ crashed{html.escape(port)}</span>'
+            if service.get('message'):
+                state += f'<div class="crash-msg">{html.escape(service["message"])}</div>'
+            if service.get('log_tail'):
+                state += f'<pre class="crash-log">{html.escape(service["log_tail"])}</pre>'
+            action = (
+                f'<button class="btn start" data-path="{path}" '
+                f'data-name="{html.escape(worktree_name + " / " + service["name"], quote=True)}">'
+                f'start {name}</button>'
+            )
+        else:
+            state = '<span class="stopped">○ stopped</span>'
+            action = (
+                f'<button class="btn start" data-path="{path}" '
+                f'data-name="{html.escape(worktree_name + " / " + service["name"], quote=True)}">'
+                f'start {name}</button>'
+            )
+        status_bits.append(
+            f'<span class="service-line"><span class="service-name">{name}</span>{state}</span>'
+        )
+        action_bits.append(f'<span class="service-line">{action}</span>')
+    return (
+        '<span class="service-list">' + ''.join(status_bits) + '</span>',
+        '<span class="service-list">' + ''.join(action_bits) + '</span>',
+    )
 
 
 def _row_html(row):
@@ -606,6 +698,7 @@ def _row_html(row):
     owner = html.escape(row.get("owner") or "", quote=True)
     project = html.escape(row.get("project") or row.get("repo") or "", quote=True)
     startable = row.get("startable", True)
+    services = _row_services(row)
     # Trailing controls every row carries, startable or not -- a worktree with
     # no dev server is still something to hand over with a comment attached.
     reveal = (f'{_copy_button(row)} '
@@ -616,6 +709,13 @@ def _row_html(row):
         status = '<span class="no-dev">no dev server</span>'
         action = reveal
         row_class = " not-startable"
+    elif len(services) > 1:
+        status, actions = _multi_service_cells(row, services)
+        action = f'{actions} {reveal}'
+        row_class = (
+            " is-running" if row['running']
+            else " is-crashed" if row.get('crashed') else ""
+        )
     elif row["running"]:
         # localhost, not 127.0.0.1: a plain `vite dev` (no --host) binds
         # IPv6 loopback only -- see preview.port_is_ready's same note.
@@ -1149,6 +1249,14 @@ tbody tr.is-crashed:hover td {{ background: #FCE8E8; }}
 .action .btn {{ white-space: nowrap; margin-block: 0.15rem; }}
 .action details {{ max-width: 28rem; white-space: normal; overflow-wrap: anywhere; margin-top: 0.4rem; color: var(--muted); }}
 .action .btn + .btn, .action .btn + a.btn, .action a.btn + .btn {{ margin-left: 0.35rem; }}
+.service-list {{ display: inline-grid; gap: 0.3rem; }}
+.service-line {{ display: flex; align-items: center; gap: 0.45rem; min-height: 1.7rem; }}
+.service-name {{
+  min-width: 3.5rem;
+  color: var(--muted);
+  font-family: "SF Mono", "Geist Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+}}
 .empty {{
   display: none;
   padding: 2rem 1rem;
@@ -1275,7 +1383,8 @@ document.addEventListener('click', async e => {{
     if (window.__boardStarting) return;
     const starting = btn.classList.contains('start');
     const label = btn.textContent;
-    const tab = starting ? window.open('/starting?name=' + encodeURIComponent(btn.closest('tr')?.dataset.name || ''), '_blank') : null;
+    const name = btn.dataset.name || btn.closest('tr')?.dataset.name || '';
+    const tab = starting ? window.open('/starting?name=' + encodeURIComponent(name), '_blank') : null;
     window.__boardStarting = true;
     btn.disabled = true;
     btn.textContent = starting ? 'preparing and starting…' : 'stopping…';

@@ -47,3 +47,29 @@ class NativeRuntimeTests(unittest.TestCase):
             'Makefile': 'dev:\n\tpython3 server.py\n',
             'server.py': "from http.server import HTTPServer, SimpleHTTPRequestHandler\nHTTPServer(('127.0.0.1', 0), SimpleHTTPRequestHandler).serve_forever()\n",
         })
+
+    def test_namespaced_node_services_start_and_stop_independently(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state:
+            root = Path(directory)
+            (root / 'package.json').write_text(json.dumps({
+                'scripts': {
+                    'dev': 'node web.cjs',
+                    'api:dev': 'node api.cjs',
+                },
+            }))
+            server = "require('http').createServer((req,res)=>res.end('ready')).listen(Number(process.env.PORT),'127.0.0.1');"
+            (root / 'web.cjs').write_text(server)
+            (root / 'api.cjs').write_text(server)
+            with patch.object(preview, 'GLOBAL_STATE_DIR', state):
+                services = preview.service_definitions(root)
+                try:
+                    web = preview.start(services[0]['path'])
+                    api = preview.start(services[1]['path'])
+                    self.assertTrue(web['ok'], web)
+                    self.assertTrue(api['ok'], api)
+                    self.assertNotEqual(web['port'], api['port'])
+                    preview.stop(services[0]['path'])
+                    self.assertTrue(preview.status(services[1]['path'])['running'])
+                finally:
+                    for service in services:
+                        preview.stop(service['path'])

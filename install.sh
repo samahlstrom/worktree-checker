@@ -21,5 +21,15 @@ if ! mv "$worktree_download/Worktree Checker.app" "$HOME/Applications/Worktree C
   fi
   exit 1
 fi
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/worktree-checker" <<'LAUNCHER'
+#!/bin/sh
+exec "$HOME/Applications/Worktree Checker.app/Contents/MacOS/Worktree Checker" "$@"
+LAUNCHER
+cat > "$HOME/.local/bin/worktree-doctor" <<'DOCTOR'
+#!/bin/sh
+exec "$HOME/Applications/Worktree Checker.app/Contents/MacOS/Worktree Checker" --doctor "$@"
+DOCTOR
+chmod +x "$HOME/.local/bin/worktree-checker" "$HOME/.local/bin/worktree-doctor"
 open "$HOME/Applications/Worktree Checker.app"
 echo 'Worktree Checker is installed. Your board is opening.'

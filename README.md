@@ -27,7 +27,7 @@ may require approval in **System Settings → Privacy & Security → Open Anyway
 ## Previews
 
 - Start uses the repository's own development command when one is present.
-- Missing project packages are prepared on demand. Compatible existing installs can
+- Start calls **Worktree Doctor** to repair missing packages, broken generated-file links, and missing ignored local settings. Compatible existing installs can
   be cloned on APFS without sharing writable dependency files.
 - Existing local environment files supply configuration; nothing is uploaded.
 - Start and Stop are serialized. A failed paired start cleans up both new servers.
@@ -37,6 +37,16 @@ may require approval in **System Settings → Privacy & Security → Open Anyway
 Project services still need their actual credentials and required external services.
 The board does not create production secrets or infer a server for a library that
 has no run command.
+
+You can also run Doctor directly:
+
+```sh
+worktree-doctor /path/to/worktree
+worktree-doctor /path/to/worktree --fix
+```
+
+Doctor and Start use the same repair code. Doctor does not create a second workspace
+or start another development server.
 
 ## Optional merged-PR cleanup
 

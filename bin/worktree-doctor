@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Check or repair the current project without starting a server."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader('doctor_preview', str(Path(__file__).with_name('preview')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+preview = importlib.util.module_from_spec(spec)
+loader.exec_module(preview)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('path', nargs='?', default=os.getcwd())
+parser.add_argument('--fix', action='store_true')
+args = parser.parse_args()
+project = preview.detect(args.path)
+if not project:
+    parser.exit(1, 'No development command was found in this project.\n')
+if args.fix:
+    with preview._transition():
+        preview.doctor.prepare(args.path, project, preview._run_setup)
+print(json.dumps(preview.doctor.health(args.path) if project['kind'] == 'node' else {'ok': True, 'project': project['label']}))

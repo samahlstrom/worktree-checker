@@ -92,6 +92,35 @@ class ProjectDetectionTests(unittest.TestCase):
             self._file(root, "app.py", "from fastapi import FastAPI\napp = FastAPI()\n")
             self.assertIsNone(project.detect(str(root)))
 
+    def test_spring_boot_requires_framework_marker_and_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "pom.xml", "<artifactId>spring-boot-starter-web</artifactId>\n")
+            self.assertIsNone(project.detect(str(root)))
+            self._file(root, "mvnw", "#!/bin/sh\n")
+            result = project.detect(str(root))
+            self.assertEqual(result["kind"], "spring-boot")
+            self.assertIn("{port}", result["argv"][-1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "build.gradle", "id 'org.springframework.boot' version '3.0.0'\n")
+            self._file(root, "gradlew", "#!/bin/sh\n")
+            result = project.detect(str(root))
+            self.assertEqual(result["argv"][0], "{root}/gradlew")
+            self.assertEqual(result["argv"][1], "bootRun")
+
+    def test_phoenix_requires_mix_framework_declaration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "mix.exs", "defp deps, do: [{:phoenix, \"~> 1.7\"}]\n")
+            result = project.detect(str(root))
+            self.assertEqual(result, {
+                "label": "Phoenix",
+                "argv": ["mix", "phx.server"],
+                "setup": [],
+                "kind": "phoenix",
+            })
+
     def test_rails_laravel_and_dotnet_have_native_commands(self):
         cases = (
             ("bin/rails", "Gemfile", "rails", ["bundle", "exec"]),

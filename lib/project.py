@@ -63,8 +63,9 @@ def _node(root, admin):
     )
     if not script_name:
         return None
-    manager = next((manager for filename, manager in _LOCKFILES
-                    if (root / filename).is_file()), None)
+    locked_manager = next((manager for filename, manager in _LOCKFILES
+                           if (root / filename).is_file()), None)
+    manager = locked_manager
     if manager is None:
         declared = package.get("packageManager")
         if isinstance(declared, str):
@@ -80,9 +81,11 @@ def _node(root, admin):
             ).is_file() else "install"
             setup = [["npm", install, "--no-audit", "--no-fund"]]
         elif manager == "pnpm":
-            setup = [["pnpm", "install", "--frozen-lockfile"]]
+            setup = [["pnpm", "install", "--frozen-lockfile"] if locked_manager else
+                     ["pnpm", "install"]]
         elif manager == "bun":
-            setup = [["bun", "install", "--frozen-lockfile"]]
+            setup = [["bun", "install", "--frozen-lockfile"] if locked_manager else
+                     ["bun", "install"]]
         else:
             setup = [["yarn", "install"]]
     return _result(
@@ -111,7 +114,7 @@ def _target(path):
     except (OSError, UnicodeError):
         return None
     for name in _TARGET_NAMES:
-        if re.search(rf"(?m)^\s*{re.escape(name)}\s*:", text):
+        if re.search(rf"(?m)^\s*(?:\[[^\]]*\]\s*)?{re.escape(name)}\s*:", text):
             return name
     return None
 
@@ -288,7 +291,8 @@ def _laravel(root):
     if not (root / "artisan").is_file():
         return None
     setup = [["composer", "install", "--no-interaction"]] if (
-        (root / "composer.lock").is_file() or (root / "composer.json").is_file()
+        ((root / "composer.lock").is_file() or (root / "composer.json").is_file())
+        and not (root / "vendor/autoload.php").is_file()
     ) else []
     return _result(
         "Laravel",

@@ -44,6 +44,10 @@ def install_login_service():
 
 def main():
     configure_path()
+    if '--doctor' in sys.argv:
+        sys.argv = [str(ROOT / 'bin/worktree-doctor'), *sys.argv[sys.argv.index('--doctor') + 1:]]
+        runpy.run_path(sys.argv[0], run_name='__main__')
+        return
     serve = '--serve' in sys.argv
     if serve:
         sys.argv = [str(ROOT / 'bin/board')]

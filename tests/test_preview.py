@@ -51,7 +51,7 @@ class PreviewLifecycleTests(unittest.TestCase):
     def test_missing_dependencies_leave_current_preview_untouched(self):
         with patch.object(preview.os.path, 'isdir', return_value=True), \
              patch.object(preview, 'dev_command', return_value='vite dev'), \
-             patch.object(preview, '_prepare_dependencies', side_effect=RuntimeError('missing')), \
+             patch.object(preview.doctor, 'prepare', side_effect=RuntimeError('missing')), \
              patch.object(preview, '_stop') as stop, patch.object(preview, '_free_ports') as free:
             with self.assertRaisesRegex(RuntimeError, 'missing'):
                 preview._start({}, ['/tree/.preview/admin', '/tree'])
@@ -68,7 +68,7 @@ class PreviewLifecycleTests(unittest.TestCase):
                 state.pop(path, None)
         with patch.object(preview.os.path, 'isdir', return_value=True), \
              patch.object(preview, 'dev_command', return_value='vite dev'), \
-             patch.object(preview, '_prepare_dependencies'), \
+             patch.object(preview.doctor, 'prepare'), \
              patch.object(preview, '_port_holders', return_value={}), \
              patch.object(preview, '_free_ports'), patch.object(preview, '_stop', side_effect=stop), \
              patch.object(preview, '_launch', side_effect=launch), \

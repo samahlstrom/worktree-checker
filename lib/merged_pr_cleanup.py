@@ -8,13 +8,12 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
-import traceback
 import uuid
 
 
@@ -22,7 +21,7 @@ CONFIG = Path.home() / '.config/worktree-checker/config.json'
 RETIRE_ROOT = Path.home() / '.local/state/worktree-preview-board/retired'
 WEBHOOK_PORT = 7778
 SCAN_INTERVAL = 60
-MAX_DRAIN_PER_SCAN = 8
+MAX_DRAIN_PER_PASS = 1
 PR_FIELDS = 'number,state,headRefName,headRefOid,mergedAt,headRepository,headRepositoryOwner'
 REPOSITORY_RE = re.compile(r'[\w.-]+/[\w.-]+')
 REMOTE_RE = re.compile(
@@ -33,6 +32,17 @@ PS_FORMAT = 'pid=,ppid=,uid=,lstart=,stat=,command='
 
 _START_LOCK = threading.Lock()
 _STARTED = None
+_SERVER_LOCK = threading.Lock()
+_SERVER = None
+_SERVER_THREAD = None
+_ACTIVE_WAKE = None
+_RETIRED_WAKE = threading.Event()
+_STATUS_LOCK = threading.Lock()
+_STATUS = {
+    'last_scan': None,
+    'configured_repositories': 0,
+    'errors': [],
+}
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,37 @@ class Process:
     uid: int
     birth: str
     command: str
+
+
+def _error(message):
+    message = ' '.join(str(message).split())[:240]
+    with _STATUS_LOCK:
+        errors = _STATUS['errors']
+        if message not in errors:
+            errors.append(message)
+            del errors[:-8]
+    print(f'worktree cleanup: {message}', file=sys.stderr, flush=True)
+
+
+def _begin_scan():
+    with _STATUS_LOCK:
+        _STATUS['last_scan'] = int(time.time())
+        _STATUS['configured_repositories'] = 0
+        _STATUS['errors'] = []
+
+
+def _set_configured(count):
+    with _STATUS_LOCK:
+        _STATUS['configured_repositories'] = count
+
+
+def health():
+    with _STATUS_LOCK:
+        result = dict(_STATUS)
+        result['errors'] = list(_STATUS['errors'])
+    result['webhook_listening'] = _SERVER is not None
+    result['ok'] = not result['errors']
+    return result
 
 
 def load_config():
@@ -139,7 +180,8 @@ def matching_pr(tree, prs, repository):
         return {}
     matches = [
         pr for pr in prs
-        if branch
+        if isinstance(pr, dict)
+        and branch
         and pr.get('headRefName') == branch
         and (pr.get('headRepository') or {}).get('name', '').casefold() == name
         and (pr.get('headRepositoryOwner') or {}).get('login', '').casefold() == owner
@@ -252,14 +294,20 @@ def _gh_prs(repository):
             '--json', PR_FIELDS,
         ], 45)
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        _error('GitHub query failed')
+        return None
     if result.returncode:
-        return []
+        _error('GitHub query failed')
+        return None
     try:
         prs = json.loads(result.stdout)
     except (TypeError, ValueError):
-        return []
-    return prs if isinstance(prs, list) else []
+        _error('GitHub returned invalid pull request data')
+        return None
+    if not isinstance(prs, list):
+        _error('GitHub returned invalid pull request data')
+        return None
+    return prs
 
 
 def _retire_target():

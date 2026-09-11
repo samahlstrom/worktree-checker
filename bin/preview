@@ -10,7 +10,6 @@ import re
 from pathlib import Path
 import signal
 import shutil
-import tempfile
 import socket
 import subprocess
 import sys
@@ -22,6 +21,7 @@ import urllib.request
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 from worktree_ports import ADMIN_PORT, OAUTH_PORT, RESERVED_PORTS, derive_port
 from project import detect
+import worktree_doctor as doctor
 
 GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
 OAUTH_REPOS = frozenset({"healthtree/one", "healthtree/next"})
@@ -72,63 +72,6 @@ def worktree_revision(path):
 def dev_command(path):
     project = detect(_runtime_root(path), admin=is_admin_app(path))
     return (project.get('script') or project['label']) if project else None
-
-
-def _host_platform():
-    """npm optional dependency name for the machine running the board."""
-    system = sys.platform.lower()
-    system = "darwin" if system.startswith("darwin") else system
-    system = "win32" if system.startswith("win") else system
-    machine = os.uname().machine.lower()
-    machine = "arm64" if machine in ("arm64", "aarch64") else machine
-    machine = "x64" if machine in ("x86_64", "amd64") else machine
-    return f"{system}-{machine}"
-
-
-def host_dependency_health(path):
-    """Verify host-native esbuild without omitting optional dependencies."""
-    runtime_root = _runtime_root(path)
-    if not os.path.isfile(os.path.join(runtime_root, "package-lock.json")):
-        return {"ok": True, "reason": "no package lock"}
-    modules = os.path.join(runtime_root, "node_modules")
-    repair = f"run npm ci in {runtime_root}"
-    if not os.path.isdir(modules) or os.path.islink(modules):
-        return {"ok": False, "error": f"host node_modules missing or linked at {modules}",
-                "repair": repair}
-    package_path = os.path.join(modules, "esbuild", "package.json")
-    try:
-        with open(package_path) as f:
-            js_version = json.load(f).get("version")
-    except (OSError, ValueError, AttributeError):
-        if "vite" not in (dev_command(path) or ""):
-            return {"ok": True}
-        return {"ok": False, "error": f"host esbuild package missing at {package_path}",
-                "repair": repair}
-    platform = _host_platform()
-    binary = os.path.join(modules, "@esbuild", platform, "bin", "esbuild")
-    if not os.path.isfile(binary):
-        return {"ok": False,
-                "error": f"host optional package @esbuild/{platform} missing ({binary})",
-                "repair": repair}
-    command = os.path.join(modules, ".bin", "esbuild")
-    if not os.path.exists(command):
-        command = binary
-    try:
-        result = subprocess.run([command, "--version"], capture_output=True,
-                                text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "error": f"host esbuild failed: {exc}",
-                "repair": repair, "binary": binary}
-    actual = (result.stdout or "").strip()
-    if result.returncode != 0:
-        detail = (result.stderr or actual or f"exit {result.returncode}").strip()
-        return {"ok": False, "error": f"host esbuild failed: {detail}",
-                "repair": repair, "binary": binary}
-    if actual != js_version:
-        return {"ok": False,
-                "error": f"host esbuild JS {js_version} != binary {actual}",
-                "repair": repair, "binary": binary}
-    return {"ok": True, "binary": binary, "version": actual}
 
 
 def _origin_url(path):
@@ -211,31 +154,11 @@ def _dotenv_value(val):
     return val
 
 
-def _primary_checkout(path):
-    """Owning primary checkout via git-common-dir -- same mechanism as
-    worktree-setup's local-env source. None when path is not a worktree."""
-    root = _runtime_root(path)
-    try:
-        r = subprocess.run(
-            ["git", "-C", root, "rev-parse", "--path-format=absolute",
-             "--git-common-dir"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    common = (r.stdout or "").strip().rstrip("/")
-    if r.returncode != 0 or not common:
-        return None
-    if os.path.basename(common) != ".git":
-        return None
-    return os.path.dirname(common)
-
-
 def _inject_admin_algolia(env, admin_path):
     """Put only the root admin's Algolia keys into env; never copy its .env."""
     env_path = os.path.join(_runtime_root(admin_path), ".env")
     if not os.path.isfile(env_path):
-        primary = _primary_checkout(admin_path)
+        primary = doctor.primary_checkout(_runtime_root(admin_path))
         env_path = os.path.join(primary, ".env") if primary else ""
         if not env_path or not os.path.isfile(env_path):
             return
@@ -304,22 +227,6 @@ def _write_vite_overlay(path, *, local_admin_bootstrap=False):
     return overlay
 
 
-def _break_foreign_svelte_kit(path):
-    """Unlink .svelte-kit only when it resolves outside this worktree.
-
-    An in-tree link is a valid local layout. A link to another checkout
-    (worktree-doctor) pins generated files to that other snapshot.
-    """
-    root = _runtime_root(path)
-    svelte = os.path.join(root, ".svelte-kit")
-    if not os.path.islink(svelte):
-        return
-    target = os.path.realpath(svelte)
-    if target == root or target.startswith(root + os.sep):
-        return
-    os.unlink(svelte)
-
-
 def _available_command(argv, root):
     """Use a repo's package manager without requiring a separate global install."""
     if argv[0] in ('pnpm', 'yarn', 'bun') and not shutil.which(argv[0]):
@@ -336,7 +243,7 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
         # Match local development: primary checkout defaults, then this tree's
         # own values. Nothing is copied into the worktree or sent off-machine.
         defaults = {}
-        primary = _primary_checkout(path)
+        primary = doctor.primary_checkout(_runtime_root(path))
         for root in dict.fromkeys(filter(None, (primary, _runtime_root(path)))):
             for name in ('.env', '.env.local', '.env.development', '.env.development.local'):
                 file = Path(root) / name
@@ -590,7 +497,10 @@ def status(path):
     if not record:
         return dict(running=False, crashed=False, port=None, pid=None)
     members = _members(record, _processes()) if record.get('process') else []
-    running = record.get('port') in _record_ports(record, _processes())
+    try:
+        running = record.get('port') in _record_ports(record, _processes())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        running = False
     result = dict(running=running, crashed=not running and not (members and record.get('starting')), port=record.get('port'),
                   pid=record.get('process', {}).get('pid'))
     if not running:
@@ -647,7 +557,6 @@ def _launch(state, path, port):
     dev = dev_command(path)
     os.makedirs(_preview_dir(path), exist_ok=True)
     _ensure_ignored(path)
-    _break_foreign_svelte_kit(path)
     project = detect(_runtime_root(path), admin=is_admin_app(path))
     overlay = _write_vite_overlay(path, local_admin_bootstrap=is_admin_app(path)) if project['kind'] == 'node' and 'vite' in dev else None
     argv, env = _build_argv_env(dev, port, loopback_host='localhost', path=path, vite_config=overlay)
@@ -727,67 +636,16 @@ def _run_setup(argv, root, log_dir):
             child.wait()
 
 
-def _prepare_dependencies(path):
-    """Prepare once on Start. APFS clones share disk blocks, not writable files."""
-    root = Path(_runtime_root(path))
-    modules = root / 'node_modules'
-    log_dir = Path(_preview_dir(path))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    project = detect(str(root), admin=is_admin_app(path))
-    if project['kind'] != 'node':
-        for command in project['setup']:
-            _run_setup([arg.replace('{root}', str(root)) for arg in command], root, log_dir)
-        return
-    health = host_dependency_health(path)
-    if modules.is_dir() and health['ok']:
-        return
-    primary = _primary_checkout(path)
-    donor = Path(primary) if primary else None
-    # Only reuse a working install from this same repo with the exact lockfile.
-    locks = ('package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb')
-    lock = next((name for name in locks if (root / name).is_file()), None)
-    compatible = bool(donor and donor != root and lock and (donor / lock).is_file()
-                      and (root / lock).read_bytes() == (donor / lock).read_bytes())
-    if compatible and (donor / 'node_modules').is_dir() and host_dependency_health(str(donor))['ok'] and sys.platform == 'darwin':
-        temporary = Path(tempfile.mkdtemp(prefix='.dependencies-', dir=log_dir))
-        try:
-            result = subprocess.run(['cp', '-cR', str(donor / 'node_modules'), str(temporary / 'node_modules')],
-                                    capture_output=True, timeout=120)
-            if result.returncode == 0:
-                if modules.is_symlink():
-                    modules.unlink()
-                elif modules.exists():
-                    shutil.rmtree(modules)
-                (temporary / 'node_modules').replace(modules)
-                if host_dependency_health(path)['ok']:
-                    return
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
-    if modules.is_symlink():
-        modules.unlink()
-    if lock == 'pnpm-lock.yaml':
-        argv = ['pnpm', 'install', '--frozen-lockfile']
-    elif lock == 'yarn.lock':
-        argv = ['yarn', 'install']
-    elif lock in ('bun.lock', 'bun.lockb'):
-        argv = ['bun', 'install', '--frozen-lockfile']
-    else:
-        argv = ['npm', 'ci' if lock == 'package-lock.json' else 'install', '--no-audit', '--no-fund']
-    _run_setup(argv, root, log_dir)
-    if not host_dependency_health(path)['ok']:
-        raise RuntimeError('Package setup did not finish correctly. Try Start again.')
-
-
 def _start(state, paths, *, restart=False):
     for path in paths:
         if not os.path.isdir(_runtime_root(path)) or not dev_command(path):
             raise RuntimeError(f'No dev script exists for {_runtime_root(path)}.')
-    _prepare_dependencies(paths[-1])
     if not restart and all(state.get(p)
                            and state[p]['port'] in _record_ports(state[p], _processes())
                            and port_is_ready(state[p]['port'], vite='vite' in dev_command(p)) for p in paths):
         return _result(state, paths, already=True)
 
+    doctor.prepare(_runtime_root(paths[-1]), detect(_runtime_root(paths[-1]), admin=is_admin_app(paths[-1])), _run_setup)
     pair = len(paths) == 2
     ports = [ADMIN_PORT, OAUTH_PORT] if pair else [
         ADMIN_PORT if is_admin_app(paths[0]) else OAUTH_PORT if is_oauth_bound(paths[0]) else derive_port(paths[0])]

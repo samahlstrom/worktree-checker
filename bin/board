@@ -58,6 +58,7 @@ def _load(name, filename):
 
 repositories = _load("board_repositories", "repositories")
 preview = _load("board_preview", "preview")
+import merged_pr_cleanup
 
 
 
@@ -1719,6 +1720,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send_bytes(f.read(), "image/png")
             except OSError:
                 self.send_error(404)
+        elif path == "/health":
+            self._json(merged_pr_cleanup.health())
         elif path == "/api/fingerprint":
             self._json({"fingerprint": fingerprint()})
         elif path == "/api/ready":
@@ -1811,6 +1814,7 @@ def main():
         print(f"board did not come up within 15s; see {BOARD_LOG}", file=sys.stderr)
         sys.exit(1)
 
+    merged_pr_cleanup.start(preview)
     threading.Thread(target=_revision_watcher, daemon=True,
                      name="board-revision-watcher").start()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

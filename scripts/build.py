@@ -26,7 +26,7 @@ for path in [*root.glob('bin/*'), *root.glob('lib/*.py'), root / 'app.py']:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.add(node.module)
 args = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--windowed',
-        '--name', 'Worktree Checker', '--osx-bundle-identifier', 'local.worktree-checker']
+        '--paths', str(root / 'lib'), '--name', 'Worktree Checker', '--osx-bundle-identifier', 'local.worktree-checker']
 for folder in ('bin', 'lib', 'assets', 'runtime'):
     args.extend(['--add-data', f'{root / folder}:{folder}'])
 for module in sorted(imports):

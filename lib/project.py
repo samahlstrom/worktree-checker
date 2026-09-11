@@ -180,7 +180,7 @@ def _requirements_file(root):
 
 
 def _python_command(root, requirements):
-    if requirements:
+    if requirements or (root / "pyproject.toml").is_file():
         return "{root}/.venv/bin/python"
     if (root / ".venv/bin/python").is_file():
         return "{root}/.venv/bin/python"
@@ -252,18 +252,21 @@ def _python_web(root, framework):
     requirements = _requirements_file(root)
     python = _python_command(root, requirements)
     if framework == "fastapi":
-        command = ["-m", "uvicorn"] if python != "python3" else ["uvicorn"]
+        command = ["-m", "uvicorn"]
         argv = [python, *command, f"{module}:{variable}", "--host", "127.0.0.1",
                 "--port", "{port}"]
     else:
-        command = ["-m", "flask"] if python != "python3" else ["flask"]
+        command = ["-m", "flask"]
         argv = [python, *command, "--app", f"{module}:{variable}", "run",
                 "--host", "127.0.0.1", "--port", "{port}"]
+    setup = _python_setup(root, requirements)
+    if framework == "fastapi" and setup:
+        setup.append([python, "-m", "pip", "install", "uvicorn"])
     return _result(
         "FastAPI" if framework == "fastapi" else "Flask",
         argv,
         framework,
-        _python_setup(root, requirements),
+        setup,
     )
 
 

@@ -88,7 +88,7 @@ class ProjectDetectionTests(unittest.TestCase):
             self._file(root, "main.py", "from fastapi import FastAPI\napp = FastAPI()\n")
             result = project.detect(str(root))
             self.assertEqual(result["kind"], "fastapi")
-            self.assertEqual(result["argv"][:2], ["uvicorn", "main:app"])
+            self.assertEqual(result["argv"][:4], ["{root}/.venv/bin/python", "-m", "uvicorn", "main:app"])
             self._file(root, "app.py", "from fastapi import FastAPI\napp = FastAPI()\n")
             self.assertIsNone(project.detect(str(root)))
 

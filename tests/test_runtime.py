@@ -1,5 +1,6 @@
 """Pure runtime ownership tests; Docker and lsof are mocked, never invoked."""
 
+import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
@@ -9,7 +10,8 @@ from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).parents[1] / "bin/preview"
-SPEC = importlib.util.spec_from_file_location("preview_runtime_under_test", MODULE_PATH)
+LOADER = importlib.machinery.SourceFileLoader("preview_runtime_under_test", str(MODULE_PATH))
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 preview = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preview)
 

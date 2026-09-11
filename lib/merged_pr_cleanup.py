@@ -320,6 +320,31 @@ def _retire_target():
     return RETIRE_ROOT / key, RETIRE_ROOT / f'{key}.json'
 
 
+def _remove_stale_manifests(original):
+    """Remove stale entries for this existing worktree before queuing a rename."""
+    try:
+        root = RETIRE_ROOT.resolve()
+        manifests = sorted(RETIRE_ROOT.glob('*.json'))
+    except OSError:
+        return
+    for manifest in manifests:
+        try:
+            stem = manifest.stem
+            target = root / stem
+            record = json.loads(manifest.read_text())
+            if (not re.fullmatch(r'[0-9a-f]{32}', stem)
+                    or manifest.resolve().parent != root
+                    or record.get('queued_path') != str(RETIRE_ROOT / stem)
+                    or Path(record.get('original_path', '')).resolve() != original.resolve()
+                    or target.is_symlink()
+                    or target.exists()
+                    or not original.exists()):
+                continue
+            manifest.unlink()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+
+
 def retire(tree, prs, repo_root, repository, preview_module):
     raw_path = tree.get('path')
     if not raw_path:
@@ -350,6 +375,7 @@ def retire(tree, prs, repo_root, repository, preview_module):
     if tree.get('locked'):
         _git(repo_root, 'worktree', 'unlock', str(path))
     pr = matching_pr(tree, prs, repository)
+    _remove_stale_manifests(path)
     target, manifest = _retire_target()
     if target.exists() or manifest.exists():
         raise RuntimeError(f'Pending retirement already exists for {path}')
@@ -362,38 +388,64 @@ def retire(tree, prs, repo_root, repository, preview_module):
     }))
     os.chmod(manifest, 0o600)
     path.rename(target)
+    _RETIRED_WAKE.set()
     _git(repo_root, 'worktree', 'prune', '--expire', 'now')
     return True
 
 
-def drain_retired(limit=MAX_DRAIN_PER_SCAN):
-    """Drain a bounded number of quarantined directories without blocking scans."""
+def drain_retired(limit=MAX_DRAIN_PER_PASS):
+    """Remove at most ``limit`` validated quarantine entries in this pass."""
+    if limit < 1:
+        return
     try:
-        manifests = sorted(RETIRE_ROOT.glob('*.json'))[:limit]
+        root = RETIRE_ROOT.resolve()
+        manifests = sorted(RETIRE_ROOT.glob('*.json'))
     except OSError:
         return
+    processed = 0
     for manifest in manifests:
+        if processed >= limit:
+            return
+        processed += 1
         try:
+            stem = manifest.stem
+            target = root / stem
             record = json.loads(manifest.read_text())
-            target = RETIRE_ROOT / manifest.stem
-            original = Path(record['original_path'])
-            if (record.get('queued_path') != str(target)
-                    or not re.fullmatch(r'[0-9a-f]{32}', manifest.stem)
+            if (not re.fullmatch(r'[0-9a-f]{32}', stem)
+                    or manifest.resolve().parent != root
+                    or target.parent.resolve() != root
+                    or record.get('queued_path') != str(RETIRE_ROOT / stem)
                     or target.is_symlink()):
                 continue
             if not target.exists():
-                if not original.exists():
-                    manifest.unlink()
+                # A prior rename or manual cleanup can leave only the manifest.
+                # The queued target is already gone, so the manifest is stale.
+                manifest.unlink()
+                return
+            if not target.is_dir():
                 continue
-            shutil.rmtree(target)
-            manifest.unlink()
-        except (OSError, ValueError, KeyError, TypeError):
+            result = _run([
+                '/usr/bin/nice', '-n', '10', '/bin/rm', '-rf', '--', str(target)
+            ], 30)
+            if result.returncode == 0:
+                manifest.unlink()
+        except (OSError, ValueError, KeyError, TypeError, AttributeError,
+                subprocess.SubprocessError):
             continue
 
 
-def scan_once(preview_module):
+def scan_once(preview_module, wake=None):
     """Reload config and perform one safe scan of every enabled repository."""
-    repositories = load_config()
+    _begin_scan()
+    try:
+        repositories = load_config()
+    except (OSError, TypeError, ValueError):
+        _set_configured(0)
+        _error('Invalid cleanup configuration')
+        _stop_server()
+        return
+    _set_configured(len(repositories))
+    _ensure_server(repositories, wake or _ACTIVE_WAKE)
     if not repositories:
         return
     for entry in repositories.values():
@@ -401,24 +453,28 @@ def scan_once(preview_module):
         repo_root = entry['path']
         try:
             if repository_name(repo_root).casefold() != repository.casefold():
+                _error('Configured repository origin does not match')
                 continue
             records = worktrees(repo_root)
             if not records or Path(records[0]['path']).resolve() != repo_root:
+                _error('Configured primary checkout was not found')
                 continue
             _git(repo_root, 'worktree', 'prune', '--expire', 'now')
             records = worktrees(repo_root)
             if not records or Path(records[0]['path']).resolve() != repo_root:
+                _error('Configured primary checkout was not found')
                 continue
             prs = _gh_prs(repository)
+            if prs is None:
+                continue
             for tree in records[1:]:
                 if tree.get('branch') and eligible(tree, prs, repo_root, repository):
                     try:
                         retire(tree, prs, repo_root, repository, preview_module)
-                    except (OSError, RuntimeError, subprocess.SubprocessError):
-                        traceback.print_exc()
+                    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                        _error('Merged worktree retirement failed')
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-            traceback.print_exc()
-    drain_retired()
+            _error('Configured repository scan failed')
 
 
 def merged_pr_number(event, body, signature, repositories):
@@ -447,18 +503,67 @@ def merged_pr_number(event, body, signature, repositories):
     return entry['repository'], number
 
 
+def _stop_server():
+    global _SERVER, _SERVER_THREAD
+    with _SERVER_LOCK:
+        server = _SERVER
+        thread = _SERVER_THREAD
+        _SERVER = None
+        _SERVER_THREAD = None
+    if server is None:
+        return
+    try:
+        server.shutdown()
+    finally:
+        server.server_close()
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=2)
+
+
+def _ensure_server(repositories, wake):
+    global _SERVER, _SERVER_THREAD
+    if wake is None or not any(entry.get('webhook_secret') for entry in repositories.values()):
+        _stop_server()
+        return
+    with _SERVER_LOCK:
+        if _SERVER is not None:
+            return
+        try:
+            server = HTTPServer(('127.0.0.1', WEBHOOK_PORT), _handler(wake))
+        except OSError:
+            _error('Webhook listener could not bind')
+            return
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True, name='worktree-webhook',
+        )
+        _SERVER = server
+        _SERVER_THREAD = thread
+        try:
+            thread.start()
+        except RuntimeError:
+            _SERVER = None
+            _SERVER_THREAD = None
+            server.server_close()
+            _error('Webhook listener could not start')
+
+
 def _handler(wake):
     class Handler(BaseHTTPRequestHandler):
-        def _reply(self, status, body):
+        def _reply(self, status, body, content_type='text/plain; charset=utf-8'):
+            if isinstance(body, str):
+                body = body.encode()
             self.send_response(status)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(body.encode())
+            self.wfile.write(body)
 
         def do_GET(self):
             path = self.path.split('?', 1)[0]
-            self._reply(200 if path == '/health' else 404,
-                        'worktree checker\n' if path == '/health' else 'Not found\n')
+            if path != '/health':
+                return self._reply(404, 'Not found\n')
+            body = json.dumps(health(), sort_keys=True, separators=(',', ':'))
+            self._reply(200, body, 'application/json; charset=utf-8')
 
         def do_POST(self):
             if self.path.split('?', 1)[0] != '/github':
@@ -473,7 +578,7 @@ def _handler(wake):
                 )
             except PermissionError:
                 return self._reply(403, 'Invalid signature\n')
-            except (ValueError, TypeError, AttributeError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 return self._reply(400, 'Invalid payload\n')
             if result:
                 wake.set()
@@ -487,35 +592,41 @@ def _handler(wake):
 
 def _worker(preview_module, wake):
     while True:
-        try:
-            scan_once(preview_module)
-        except Exception:
-            traceback.print_exc()
-        wake.wait(SCAN_INTERVAL)
         wake.clear()
+        try:
+            scan_once(preview_module, wake)
+        except Exception:
+            _error('Cleanup scan failed')
+        wake.wait(SCAN_INTERVAL)
+
+
+def _garbage_worker():
+    while True:
+        _RETIRED_WAKE.clear()
+        try:
+            if load_config():
+                drain_retired()
+        except (OSError, TypeError, ValueError, AttributeError):
+            pass
+        _RETIRED_WAKE.wait(SCAN_INTERVAL)
 
 
 def start(preview_module):
-    """Start one cleanup worker and one loopback-only webhook server."""
-    global _STARTED
+    """Start cleanup and garbage workers; bind webhooks only after opt-in."""
+    global _ACTIVE_WAKE, _STARTED
     with _START_LOCK:
         if _STARTED is not None:
             return _STARTED
         wake = threading.Event()
+        _ACTIVE_WAKE = wake
         worker = threading.Thread(
             target=_worker, args=(preview_module, wake), daemon=True,
             name='worktree-cleanup',
         )
+        garbage = threading.Thread(
+            target=_garbage_worker, daemon=True, name='worktree-garbage',
+        )
+        _STARTED = worker, garbage
         worker.start()
-        try:
-            server = HTTPServer(('127.0.0.1', WEBHOOK_PORT), _handler(wake))
-        except OSError:
-            server = None
-            server_thread = None
-        else:
-            server_thread = threading.Thread(
-                target=server.serve_forever, daemon=True, name='worktree-webhook',
-            )
-            server_thread.start()
-        _STARTED = worker, server, server_thread
+        garbage.start()
         return _STARTED

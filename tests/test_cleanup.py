@@ -3,8 +3,10 @@ import hmac
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -108,6 +110,41 @@ class CleanupTests(unittest.TestCase):
         reused = cleanup.Process(123, 1, 501, 'new-birth', 'node')
         self.assertFalse(cleanup._same_process(old, reused))
         self.assertTrue(cleanup._same_process(old, old))
+
+    def test_github_failure_is_visible_and_does_not_look_empty(self):
+        result = subprocess.CompletedProcess(['gh'], 1, '', 'authentication failed')
+        with patch.object(cleanup, '_run', return_value=result):
+            self.assertIsNone(cleanup._gh_prs(REPOSITORY))
+        status = cleanup.health()
+        self.assertFalse(status['ok'])
+        self.assertTrue(status['errors'])
+        self.assertNotIn('authentication failed', json.dumps(status))
+
+    def test_disabled_config_does_not_bind_webhook_port(self):
+        with patch.object(cleanup, 'HTTPServer') as server, \
+                patch.object(cleanup, '_stop_server') as stop:
+            cleanup._ensure_server({}, threading.Event())
+        server.assert_not_called()
+        stop.assert_called_once_with()
+
+    def test_missing_quarantine_target_removes_stale_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'retired'
+            root.mkdir()
+            original = Path(temporary) / 'original'
+            original.mkdir()
+            key = 'a' * 32
+            target = root / key
+            manifest = root / f'{key}.json'
+            manifest.write_text(json.dumps({
+                'original_path': str(original),
+                'queued_path': str(target),
+            }))
+            with patch.object(cleanup, 'RETIRE_ROOT', root), \
+                    patch.object(cleanup, '_run') as run:
+                cleanup.drain_retired()
+            self.assertFalse(manifest.exists())
+            run.assert_not_called()
 
     def test_retire_stops_pair_rechecks_branch_and_quarantines(self):
         branch = BRANCH

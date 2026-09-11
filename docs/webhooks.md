@@ -38,7 +38,8 @@ The app reloads the config on every scan and webhook event. It checks GitHub at
 startup and every 60 seconds. A webhook only wakes that scan; Worktree Checker
 still fetches GitHub state before it retires anything. The `gh` CLI must be
 installed and authenticated for cleanup. If it is missing or cannot read the
-repository, the local board continues to work and the worktree stays in place.
+repository, the local board continues to work, the worktree stays in place,
+and `/health` reports the failed scan.
 
 The match requires the exact repository and exact PR head branch. The newest PR
 for that branch wins, so do not reuse a branch for a new delivery after its old
@@ -60,15 +61,20 @@ later retry.
 
 ## Optional GitHub webhook
 
-The webhook listener is loopback-only at `127.0.0.1:7778`:
+The webhook listener is loopback-only at `127.0.0.1:7778` when at least one
+configured repository has a non-empty `webhook_secret`. With an absent or
+empty config, Worktree Checker does not bind the port.
+
+The endpoints are:
 
 ```text
 POST /github
 GET  /health
 ```
 
-`GET /health` returns a generic health response and never exposes repository
-names or secrets. Configure the repository's GitHub webhook to send signed
+`GET /health` returns scan time, configured repository count, listener state,
+and sanitized errors. It never exposes repository names or secrets. Configure
+the repository's GitHub webhook to send signed
 `pull_request` events to `/github`, with the same `webhook_secret` from the
 local config and the `pull_request` event selected. GitHub webhook settings and
 an optional reverse proxy or Tailscale route can expose that loopback endpoint;
@@ -79,3 +85,6 @@ same-repository head wake the worker. Fork PRs and all other events are ignored.
 The periodic GitHub scan remains the recovery path for missed webhooks.
 
 The cleanup service does not require Herdr, Samson, or any agent harness.
+GitHub webhooks are the only event hook; the service does not run arbitrary
+shell hooks. Quarantine removal runs in a separate low-priority worker, one
+entry at a time, so a slow removal does not hold up repository scans.

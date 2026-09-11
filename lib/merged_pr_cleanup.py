@@ -361,7 +361,7 @@ def retire(tree, prs, repo_root, repository, preview_module):
     branch = tree.get('branch', '')
     if _git(path, 'symbolic-ref', 'HEAD', timeout=10) != branch:
         return False
-    stopped = preview_module.stop_pair(str(path))
+    stopped = preview_module.stop(str(path))
     if isinstance(stopped, dict) and not stopped.get('ok', True):
         raise RuntimeError(stopped.get('message') or 'Could not stop the preview')
     if _git(path, 'symbolic-ref', 'HEAD', timeout=10) != branch:

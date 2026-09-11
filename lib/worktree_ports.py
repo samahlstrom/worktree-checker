@@ -4,9 +4,6 @@ import os
 
 PORT_BASE = 4000
 PORT_RANGE = 1000
-OAUTH_PORT = 6173
-ADMIN_PORT = 3200
-RESERVED_PORTS = frozenset({OAUTH_PORT, ADMIN_PORT})
 
 
 def _path_hash(path):

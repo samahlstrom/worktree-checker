@@ -61,16 +61,13 @@ preview = _load("board_preview", "preview")
 import merged_pr_cleanup
 
 
-
-
-
 def clear_pr_cache():
     """Drop the in-process PR list cache (tests; also available for manual refresh)."""
     _PR_CACHE.clear()
 
 
 def pr_state_label(gh_state):
-    """Map GitHub PR state to Sam's labels.
+    """Map GitHub PR state to board labels.
 
     OPEN -> Open, MERGED -> Merged, CLOSED (not merged) -> Cancelled.
     """
@@ -105,7 +102,7 @@ def origin_full_name(repo_root):
 def project_identity(repo_root):
     """(owner, project) for filtering.
 
-    GitHub origin -> ("HealthTree", "HealthTree/one"). No remote / non-GitHub
+    GitHub origin -> ("owner", "owner/project"). No remote / non-GitHub
     falls back to ("", basename) so local roots stay filterable.
     Reuses origin_full_name -- no second remote parser.
     """
@@ -121,7 +118,7 @@ def project_filter_options(rows):
 
     Returns list of (value, label): 'all', owner:Owner, project:Owner/repo
     (or project:dirname for no-remote roots). Owners and projects are
-    individually selectable -- HealthTree matches one+next; HealthTree/one
+    individually selectable -- an owner matches its repositories; owner/project
     matches only one.
     """
     owners = set()
@@ -225,15 +222,7 @@ def list_prs_for_repo(repo_root, full_name=None, runner=None, now=None):
 
 
 def _parse_worktrees(repo_root):
-    """Every LINKED worktree of repo_root (path/head/branch), excluding the
-    primary checkout, straight from git -- ground truth even for a worktree
-    whose directory was already deleted. The primary checkout is dropped on
-    purpose (switchboard-xt7): for a repo like `one`, its linked worktrees
-    live nested inside it (.claude/worktrees/<name>), so a dev server started
-    on the primary checkout watches every nested worktree copy too and
-    double-initializes Firebase. Sam previews branch work, not the main
-    checkout, so the row is simply never offered -- same exclusion bin/sweep
-    already applies (see its repo_worktrees)."""
+    """List linked worktrees from Git, excluding the primary checkout."""
     r = subprocess.run(["git", "-C", repo_root, "worktree", "list", "--porcelain"],
                        capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
@@ -259,7 +248,7 @@ def _commit_dates(repo_root, heads):
     """Map head sha -> %cI for a whole repo in one git call.
 
     With ~150+ linked worktrees, a per-worktree `git log -1` was the next hang
-    risk after the old per-worktree oauth probe. --no-walk resolves each sha
+    risk when repeated per worktree. --no-walk resolves each sha
     without walking history.
     """
     unique = [h for h in dict.fromkeys(heads) if h]
@@ -281,33 +270,6 @@ def _commit_dates(repo_root, heads):
         sha, date = line.split("\t", 1)
         out[sha] = date
     return out
-
-
-def _admin_fields(worktree_path):
-    """The worktree's root admin v3 target, if it has one.
-
-    Admin v3 runs from the worktree root on :3200. Its synthetic component
-    path is state only under .preview/admin; it never creates an admin tree.
-    Rows without scripts.admin:dev get no admin.
-    """
-    admin_path = preview.admin_component_path(worktree_path)
-    if preview.dev_command(admin_path) is None:
-        return {
-            "admin_path": "", "admin_running": False, "admin_port": None,
-            "admin_crashed": False, "admin_log_tail": "", "admin_message": "",
-            "admin_served_revision": "",
-        }
-    st = preview.status(admin_path)
-    return {
-        "admin_path": admin_path,
-        "admin_running": st["running"],
-        "admin_port": st["port"] or preview.ADMIN_PORT,
-        "admin_crashed": bool(st.get("crashed")),
-        "admin_log_tail": st.get("log_tail") or "",
-        "admin_message": st.get("message") or "",
-        "pid": st.get("pid"),
-        "admin_served_revision": preview.served_revision(admin_path) if st["running"] else "",
-    }
 
 
 def _empty_pr_fields():
@@ -340,14 +302,13 @@ def build_rows():
 
     A worktree is startable only when package.json has scripts.dev. Non-
     startable rows never get a Start button; they keep a reveal affordance
-    so Sam can open the folder.
+    so the user can open the folder.
 
     PR data is joined on branch name after one cached `gh pr list` per repo
     (never per worktree). Soft-fail: missing origin / non-GitHub / gh errors
     leave PR cells empty rather than blanking the page.
     """
     rows = []
-    oauth_by_repo = {}
     prs_by_repo = {}
     identity_by_repo = {}
     for repo_root in repositories.repo_roots():
@@ -355,17 +316,11 @@ def build_rows():
                    if entry.get("path") and os.path.isdir(entry["path"])]
         if not entries:
             continue
-        if repo_root not in oauth_by_repo:
-            # Once per repo, not per worktree (114 worktrees x ~0.6s each hung
-            # the page): Google OAuth usage is a property of the app, not of
-            # which branch is checked out, so the repo's own checkout answers
-            # it for every one of its worktrees.
-            oauth_by_repo[repo_root] = preview.is_oauth_bound(repo_root)
         if repo_root not in identity_by_repo:
             identity_by_repo[repo_root] = project_identity(repo_root)
         if repo_root not in prs_by_repo:
             # One gh pr list per repo (cached). Never one call per worktree --
-            # that previously hung the page (see oauth note above).
+            # that would block the page.
             try:
                 prs_by_repo[repo_root] = list_prs_for_repo(repo_root)
             except Exception:
@@ -378,13 +333,6 @@ def build_rows():
             # Non-startable trees never run a preview; skip pid/port IO.
             if startable:
                 st = preview.status(path)
-                admin = _admin_fields(path)
-                # A process can die after its first status probe while its pair
-                # is being read. Reconcile both components once more before
-                # rendering so a refresh cannot promote that stale snapshot.
-                if st["running"] or admin["admin_running"]:
-                    st = preview.status(path)
-                    admin = _admin_fields(path)
                 running, port = st["running"], st["port"]
                 crashed = bool(st.get("crashed"))
                 log_tail = st.get("log_tail") or ""
@@ -393,7 +341,6 @@ def build_rows():
             else:
                 running, port = False, None
                 crashed, log_tail, status_message, served_revision = False, "", "", ""
-                admin = _admin_fields(path)
             branch = entry.get("branch", "")
             m = LINEAR_ID_RE.search(branch)
             pr = prs_by_repo[repo_root].get(branch)
@@ -413,39 +360,18 @@ def build_rows():
                 "log_tail": log_tail,
                 "message": status_message,
                 "port": port,
-                "oauth_bound": oauth_by_repo[repo_root] if startable else False,
                 "startable": startable,
                 "head": head,
                 "served_revision": served_revision,
             }
             row.update(_pr_fields(pr))
-            row.update(admin)
             rows.append(row)
     rows.sort(key=lambda r: r["commit_date"], reverse=True)
     # Running worktrees first. Two stable sorts, not one compound key: the date
     # ordering above survives underneath. Among 160 rows the one actually
     # serving is otherwise unfindable, and coming back from the app to stop it
     # is exactly when you need it.
-    rows.sort(key=lambda r: not (r.get("running") or r.get("admin_running")))
-    return _mark_oauth_holder(rows)
-
-
-def _mark_oauth_holder(rows):
-    """Tell waiting rows which worktree holds each shared port.
-
-    :6173 (One/next) and :3200 (per-worktree admin) are both singletons for
-    different reasons. Naming the holder turns 'takes over' from a threat into
-    a fact -- and when nobody holds the port, the row says plain start instead
-    of claiming a takeover that is not happening.
-    """
-    oauth_holder = next((r["name"] for r in rows
-                         if r.get("oauth_bound") and r.get("running")), "")
-    admin_holder = next((r["name"] for r in rows if r.get("admin_running")), "")
-    for r in rows:
-        if r.get("oauth_bound") and not r.get("running"):
-            r["oauth_holder"] = oauth_holder
-        if r.get("admin_path") and not r.get("admin_running"):
-            r["admin_holder"] = admin_holder
+    rows.sort(key=lambda r: not r.get("running"))
     return rows
 
 
@@ -552,64 +478,29 @@ def _search_blob(row):
     return " ".join(parts).lower()
 
 
-def start_pair(worktree_path, force=False):
-    return preview.start_pair(worktree_path, force=force)
-
-
-
-
-
-def stop_pair(worktree_path):
-    return preview.stop_pair(worktree_path)
-
-
-def restart_pair(worktree_path, expected_revision=None):
-    return preview.restart(worktree_path, pair=True, expected_revision=expected_revision)
-
-
 def refresh_running_previews(now=None):
-    """Debounce committed HEAD changes, then restart their exact preview(s)."""
+    """Restart a running preview after its worktree HEAD settles."""
     now = time.monotonic() if now is None else now
+    for path in preview._load_state():
+        if preview.dev_command(path) is None:
+            preview.stop(path)
     for repo_root in _cached_repo_roots():
         for path in _cached_worktree_paths(repo_root):
             if not os.path.isdir(path) or preview.dev_command(path) is None:
                 continue
-            main = preview.status(path)
-            admin_path = preview.admin_component_path(path)
-            admin = preview.status(admin_path)
-            if not main.get("running") and not admin.get("running"):
-                _REVISION_PENDING.pop(path, None)
-                continue
+            running = preview.status(path)
             current = preview.worktree_revision(path)
-            if not current:
-                _REVISION_PENDING.pop(path, None)
-                continue
-            served = [
-                preview.served_revision(path) if main.get("running") else "",
-                preview.served_revision(admin_path) if admin.get("running") else "",
-            ]
-            running_revisions = [
-                revision for revision, running in zip(
-                    served, (main.get("running"), admin.get("running"))
-                ) if running
-            ]
-            if all(revision == current for revision in running_revisions):
+            if not running.get("running") or not current or preview.served_revision(path) == current:
                 _REVISION_PENDING.pop(path, None)
                 continue
             pending = _REVISION_PENDING.get(path)
             if pending is None or pending[0] != current:
                 _REVISION_PENDING[path] = (current, now)
                 continue
-            if now - pending[1] < REVISION_DEBOUNCE_S:
-                continue
-            if main.get("running") and admin.get("running"):
-                result = restart_pair(path, expected_revision=current)
-            elif main.get("running"):
+            if now - pending[1] >= REVISION_DEBOUNCE_S:
                 result = preview.restart(path, expected_revision=current)
-            else:
-                result = preview.restart(admin_path, expected_revision=current)
-            if result.get("ok"):
-                _REVISION_PENDING.pop(path, None)
+                if result.get("ok"):
+                    _REVISION_PENDING.pop(path, None)
 
 
 def _revision_watcher():
@@ -637,68 +528,29 @@ def _reveal_path(path):
     return {"ok": True}
 
 
-def _admin_login_recovery_link(port):
-    """Explicit local recovery; normal admin links deliberately leave sessions alone."""
-    url = f"http://localhost:{port}{preview.LOCAL_ADMIN_BOOTSTRAP_PATH}"
-    return (
-        f'<a class="btn admin-recovery" href="{html.escape(url)}" target="_blank" '
-        'rel="noopener" title="Clear the local session and open admin login">'
-        'reset admin login</a>'
-    )
-
-
 def _running_banner(rows):
-    """Header line naming what is serving right now, with a stop control.
-
-    The table alone does not answer 'what is up?' once there are 160 rows, and
-    the moment you need that answer is when you come back from the app wanting
-    the port released. Empty string when nothing runs, so the header stays quiet.
-
-    A HealthTree/one row can hold both :6173 (app) and :3200 (that worktree's
-    admin). Show both ports on one chip and stop them together.
-    """
-    live = [r for r in rows if r.get("running") or r.get("admin_running")]
-    if not live:
-        return ""
+    """Show each running preview with its URL and Stop control."""
     items = []
-    for r in live:
-        path_q = html.escape(urllib.parse.quote(r["path"]), quote=True)
-        links = []
-        if r.get("running"):
-            links.append(
-                f'<a class="live-link" href="http://localhost:{r["port"]}/" '
-                f'target="_blank" rel="noopener">{html.escape(r["name"])}'
-                f'<span class="live-port">:{r["port"]}</span></a>'
-            )
-        if r.get("admin_running"):
-            label = html.escape(r["name"]) if not r.get("running") else "admin"
-            links.append(
-                f'<a class="live-link" href="http://localhost:{r["admin_port"]}/" '
-                f'target="_blank" rel="noopener">{label}'
-                f'<span class="live-port">:{r["admin_port"]}</span></a>'
-            )
-        if r.get("running") and r.get("admin_running") and r.get("admin_path"):
-            links.append(_admin_login_recovery_link(r["admin_port"]))
-        if r.get("admin_path"):
-            stop = (f'<button class="btn stop stop-pair" data-path="{path_q}">'
-                    f'stop both</button>')
-        else:
-            stop = f'<button class="btn stop" data-path="{path_q}">stop</button>'
+    for row in rows:
+        if not row.get("running"):
+            continue
+        path = html.escape(urllib.parse.quote(row["path"]), quote=True)
         items.append(
-            f'<span class="live-item">'
-            + "".join(links)
-            + stop
-            + '</span>'
+            f'<span class="live-item"><a class="live-link" href="http://localhost:{row["port"]}/" '
+            f'target="_blank" rel="noopener">{html.escape(row["name"])}'
+            f'<span class="live-port">:{row["port"]}</span></a>'
+            f'<button class="btn stop" data-path="{path}">stop</button></span>'
         )
+    if not items:
+        return ""
     return ('<div class="live-bar"><span class="live-dot">●</span>'
-            '<span class="live-label">serving now</span>'
-            + "".join(items) + '</div>')
+            '<span class="live-label">serving now</span>' + ''.join(items) + '</div>')
 
 
 def copy_payload(row):
     """The handoff block the copy button puts on the clipboard.
 
-    Carries path and branch alongside the name/PR/issue Sam asked for: those
+    Carries the worktree path, branch, project, PR, and issue: those
     are what make the paste actionable without a round of "which worktree?"
     questions. Lines are omitted rather than left blank so a detached or
     PR-less row pastes clean.
@@ -732,113 +584,9 @@ def _copy_button(row):
             f'title="Copy this card&#39;s details to paste into chat">copy</button>')
 
 
-def _pair_capable(row):
-    """True when this worktree has root app and admin v3 dev scripts.
-
-    preview.dev_command resolves the admin component to scripts.admin:dev;
-    other repositories without that script leave admin_path empty.
-    """
-    return bool(row.get("startable") and row.get("admin_path"))
-
-
-def _admin_button(row):
-    """Solo admin control for non-pair rows, or partial recovery.
-
-    Pair-capable rows use start-pair / stop-pair as the primary action; this
-    button only appears when the row has admin but is not startable (no root
-    dev server), so admin can still be brought up alone.
-    """
-    admin_path = row.get("admin_path") or ""
-    if not admin_path:
-        return ""
-    q = html.escape(urllib.parse.quote(admin_path), quote=True)
-    if row.get("admin_running"):
-        url = f"http://localhost:{row['admin_port']}/"
-        return (f'<a class="btn admin-open" href="{html.escape(url)}" target="_blank" '
-                f'rel="noopener">admin :{row["admin_port"]}</a> '
-                f'<button class="btn stop" data-path="{q}">stop admin</button>')
-    label = f"admin :{preview.ADMIN_PORT}"
-    if row.get("admin_holder"):
-        label += " (takes over)"
-    return (f'<button class="btn start admin-start" data-path="{q}">'
-            f'{html.escape(label)}</button>')
-
-
-def _start_label(row):
-    """What the start button actually promises.
-
-    Only an OAuth row can displace another worktree, and only while one is
-    really holding the port -- otherwise 'takes over' is a threat about nothing.
-    """
-    if not row.get("oauth_bound"):
-        return "start"
-    # Deliberately does not name the holder: worktree names run to 40+ chars
-    # (eng-5143-coach-training-per-lesson-completion) and blew the action column
-    # past the table edge. The banner above names who is serving.
-    if row.get("oauth_holder"):
-        return f"start :{preview.OAUTH_PORT} (takes over)"
-    return f"start :{preview.OAUTH_PORT}"
-
-
-def _pair_start_label(row):
-    """One-click start for the impersonation pair: app :6173 + this worktree's admin :3200.
-
-    Either shared port already held by another worktree triggers the same
-    '(takes over)' wording the solo OAuth start button already uses.
-    """
-    base = f"start :{preview.OAUTH_PORT} + admin"
-    if row.get("oauth_holder") or row.get("admin_holder"):
-        return f"{base} (takes over)"
-    return base
-
-
-def _pair_actions(row, path_q):
-    """Primary controls when the worktree has both One and admin."""
-    bits = []
-    both = bool(row.get("running") and row.get("admin_running"))
-    either = bool(row.get("running") or row.get("admin_running"))
-    if not both:
-        bits.append(
-            f'<button class="btn start start-pair" data-path="{path_q}">'
-            f'{html.escape(_pair_start_label(row))}</button>'
-        )
-    if row.get("running"):
-        url = f"http://localhost:{row['port']}/"
-        bits.append(
-            f'<a class="btn open" href="{html.escape(url)}" target="_blank">open</a>'
-        )
-    if row.get("admin_running"):
-        admin_url = f"http://localhost:{row['admin_port']}/"
-        bits.append(
-            f'<a class="btn admin-open" href="{html.escape(admin_url)}" '
-            f'target="_blank" rel="noopener">admin :{row["admin_port"]}</a>'
-        )
-        if both:
-            bits.append(_admin_login_recovery_link(row["admin_port"]))
-    if both:
-        # Admin is the impersonation entry: sign in, then "Log in as user".
-        admin_url = f"http://localhost:{row['admin_port']}/"
-        bits.append(
-            f'<a class="btn open impersonate" href="{html.escape(admin_url)}" '
-            f'target="_blank" rel="noopener" '
-            f'title="Sign in to admin, then Log in as user to land on :'
-            f'{preview.OAUTH_PORT}">impersonate</a>'
-        )
-    if either:
-        bits.append(
-            f'<button class="btn stop stop-pair" data-path="{path_q}">stop both</button>'
-        )
-    bits.append(_copy_button(row))
-    bits.append(
-        f'<button class="btn reveal" data-path="{path_q}" '
-        f'title="Reveal in Finder">reveal</button>'
-    )
-    return " ".join(bits)
-
-
 def _served_identity(row):
     """Visible proof of the exact worktree revision a live process serves."""
-    revision = row.get("served_revision") or row.get("admin_served_revision") or ""
+    revision = row.get("served_revision") or ""
     if not revision:
         return ""
     head = row.get("head") or ""
@@ -847,63 +595,6 @@ def _served_identity(row):
     title = f"Serving {row.get('path') or ''} at {revision}"
     return (f' <span class="{"crashed" if stale else "shared"}" '
             f'title="{html.escape(title, quote=True)}">{html.escape(label)}</span>')
-
-
-def _pair_status(row):
-    """Status cell for a pair-capable row: show both ports when either is up."""
-    notes = _shared_port_note(row)
-    identity = _served_identity(row)
-    if row.get("running") and row.get("admin_running"):
-        return (f'<span class="running">● running :{row["port"]} + admin :'
-                f'{row["admin_port"]}</span>{identity}{notes}')
-    if row.get("running"):
-        admin_state = "crashed" if row.get("admin_crashed") else "stopped"
-        status = (f'<span class="running">● running :{row["port"]}</span>'
-                  f'<span class="{"crashed" if row.get("admin_crashed") else "stopped"}">'
-                  f' · admin {admin_state}</span>{identity}{notes}')
-        if row.get("admin_message"):
-            status += f'<div class="crash-msg">{html.escape(row["admin_message"])}</div>'
-        if row.get("admin_log_tail"):
-            status += f'<pre class="crash-log">{html.escape(row["admin_log_tail"])}</pre>'
-        return status
-    if row.get("admin_running"):
-        app_state = "crashed" if row.get("crashed") else "stopped"
-        status = (f'<span class="running">● admin :{row["admin_port"]}</span>'
-                  f'<span class="{"crashed" if row.get("crashed") else "stopped"}">'
-                  f' · app {app_state}</span>{identity}{notes}')
-        if row.get("message"):
-            status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
-        if row.get("log_tail"):
-            status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
-        return status
-    if row.get("admin_crashed"):
-        status = f'<span class="crashed">✕ admin crashed</span>{notes}'
-        if row.get("admin_message"):
-            status += f'<div class="crash-msg">{html.escape(row["admin_message"])}</div>'
-        if row.get("admin_log_tail"):
-            status += f'<pre class="crash-log">{html.escape(row["admin_log_tail"])}</pre>'
-        return status
-    if row.get("crashed"):
-        port_bit = f" :{row['port']}" if row.get("port") else ""
-        status = (f'<span class="crashed">✕ crashed{html.escape(port_bit)}</span>{notes}')
-        if row.get("message"):
-            status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
-        if row.get("log_tail"):
-            status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
-        return status
-    return f'<span class="stopped">○ stopped</span>{notes}'
-
-
-def _shared_port_note(row):
-    """Badge every OAuth row carries, running or not: this worktree can only
-    serve on the one port Google's OAuth client will accept, so its repo's
-    worktrees take turns. Stopped rows need it most -- that is where the
-    surprise ('why did my other tab die?') actually lands."""
-    if not row.get("oauth_bound"):
-        return ""
-    return (f' <span class="shared" title="HealthTree sign-in only works on '
-            f'localhost:{preview.OAUTH_PORT}, so one worktree serves at a time">'
-            f'shared :{preview.OAUTH_PORT}</span>')
 
 
 def _row_html(row):
@@ -917,26 +608,11 @@ def _row_html(row):
     startable = row.get("startable", True)
     # Trailing controls every row carries, startable or not -- a worktree with
     # no dev server is still something to hand over with a comment attached.
-    # The admin sits here too: it is independent of the main app's state, so a
-    # row with no root dev server can still have one.
-    admin_btn = _admin_button(row)
-    reveal = ((f'{admin_btn} ' if admin_btn else "")
-              + f'{_copy_button(row)} '
-              + f'<button class="btn reveal" data-path="{path_q}" '
-                f'title="Reveal in Finder">reveal</button>')
+    reveal = (f'{_copy_button(row)} '
+              f'<button class="btn reveal" data-path="{path_q}" '
+              f'title="Reveal in Finder">reveal</button>')
 
-    if _pair_capable(row):
-        # Primary interaction: one click starts app :6173 + this worktree's
-        # admin :3200 (the impersonation precondition).
-        status = _pair_status(row)
-        action = _pair_actions(row, path_q)
-        if row.get("running") or row.get("admin_running"):
-            row_class = " is-running"
-        elif row.get("crashed") or row.get("admin_crashed"):
-            row_class = " is-crashed"
-        else:
-            row_class = ""
-    elif not startable:
+    if not startable:
         status = '<span class="no-dev">no dev server</span>'
         action = reveal
         row_class = " not-startable"
@@ -945,28 +621,27 @@ def _row_html(row):
         # IPv6 loopback only -- see preview.port_is_ready's same note.
         url = f"http://localhost:{row['port']}/"
         status = (f'<span class="running">● running :{row["port"]}</span>'
-                  f'{_served_identity(row)}{_shared_port_note(row)}')
+                  f'{_served_identity(row)}')
         action = (f'<a class="btn open" href="{html.escape(url)}" target="_blank">open</a> '
                  f'<button class="btn stop" data-path="{path_q}">stop</button> '
                  f'{reveal}')
         row_class = " is-running"
     elif row.get("crashed"):
-        # Dead process (not intentional stop). Show log tail so Sam sees the
-        # Firebase/node reason without hunting .preview/log (switchboard-9hz).
+        # Dead process (not intentional stop). Show log tail so the user sees the
+        # process failure without hunting .preview/log (switchboard-9hz).
         port_bit = f" :{row['port']}" if row.get("port") else ""
-        status = (f'<span class="crashed">✕ crashed{html.escape(port_bit)}</span>'
-                  f'{_shared_port_note(row)}')
+        status = f'<span class="crashed">✕ crashed{html.escape(port_bit)}</span>'
         if row.get("message"):
             status += f'<div class="crash-msg">{html.escape(row["message"])}</div>'
         if row.get("log_tail"):
             status += f'<pre class="crash-log">{html.escape(row["log_tail"])}</pre>'
-        label = _start_label(row)
+        label = "start"
         action = (f'<button class="btn start" data-path="{path_q}">{html.escape(label)}</button> '
                  f'{reveal}')
         row_class = " is-crashed"
     else:
-        status = f'<span class="stopped">○ stopped</span>{_shared_port_note(row)}'
-        label = _start_label(row)
+        status = f'<span class="stopped">○ stopped</span>'
+        label = "start"
         action = (f'<button class="btn start" data-path="{path_q}">{html.escape(label)}</button> '
                  f'{reveal}')
         row_class = ""
@@ -1599,20 +1274,17 @@ document.addEventListener('click', async e => {{
   if (btn.classList.contains('start') || btn.classList.contains('stop')) {{
     if (window.__boardStarting) return;
     const starting = btn.classList.contains('start');
-    const pair = btn.classList.contains('start-pair') || btn.classList.contains('stop-pair');
     const label = btn.textContent;
     const tab = starting ? window.open('/starting?name=' + encodeURIComponent(btn.closest('tr')?.dataset.name || ''), '_blank') : null;
     window.__boardStarting = true;
     btn.disabled = true;
     btn.textContent = starting ? 'preparing and starting…' : 'stopping…';
     try {{
-      const action = (starting ? 'start' : 'stop') + (pair ? '-pair' : '');
+      const action = starting ? 'start' : 'stop';
       const data = await request('/api/' + action + '?path=' + path, {{method: 'POST'}}, 780000);
       if (!data.ok) throw new Error([data.message || data.error || 'The action failed.', data.log_tail || ''].filter(Boolean).join('\\n'));
       if (starting) {{
-        const land = pair
-          ? 'http://localhost:' + data.admin_port + (data.already_running ? '/' : '{admin_bootstrap_path}')
-          : 'http://localhost:' + data.port + '/';
+        const land = 'http://localhost:' + data.port + '/';
         if (tab && !tab.closed) tab.location = land; else window.open(land, '_blank');
       }}
       location.reload();
@@ -1666,8 +1338,6 @@ def render_page():
         rows="\n".join(_row_html(r) for r in rows),
         project_options=_project_options_html(rows),
         running_banner=_running_banner(rows),
-        oauth_port=preview.OAUTH_PORT,
-        admin_bootstrap_path=preview.LOCAL_ADMIN_BOOTSTRAP_PATH,
         fingerprint=current_fingerprint,
     )
 
@@ -1743,15 +1413,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, qs = self._query()
         wt = qs.get("path", [""])[0]
         if path == "/api/start":
-            force = qs.get("force", ["0"])[0] == "1"
-            self._json(preview.start(wt, force=force))
-        elif path == "/api/start-pair":
-            force = qs.get("force", ["0"])[0] == "1"
-            self._json(start_pair(wt, force=force))
+            self._json(preview.start(wt))
         elif path == "/api/stop":
             self._json(preview.stop(wt))
-        elif path == "/api/stop-pair":
-            self._json(stop_pair(wt))
         elif path == "/api/reveal":
             self._json(_reveal_path(wt))
         else:

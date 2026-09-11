@@ -17,6 +17,10 @@ curl -fsSL https://raw.githubusercontent.com/samahlstrom/worktree-checker/main/i
 It downloads the app, installs it in your Applications folder, and opens the board.
 There is no repository setup step.
 
+The first background scan may take some time. A repository in an unusual folder is
+found on the next scan, about every 60 seconds; worktrees of known repositories update
+in about 500 milliseconds.
+
 Or download the macOS ZIP for your Mac from [Releases](https://github.com/samahlstrom/worktree-checker/releases).
 Unzip, move **Worktree Checker.app** to Applications, and open it. The board opens at
 <http://127.0.0.1:7777> and starts at login thereafter.
@@ -31,7 +35,7 @@ may require approval in **System Settings → Privacy & Security → Open Anyway
 - Start calls **Worktree Doctor** to repair missing packages, broken generated-file links, and missing ignored local settings. Compatible existing installs can
   be cloned on APFS without sharing writable dependency files.
 - Existing local environment files supply configuration; nothing is uploaded.
-- Start and Stop are serialized. A failed paired start cleans up both new servers.
+- Start and Stop are serialized. A failed start cleans up the new server.
 - Stop waits for the managed processes to exit. Repeating Stop is safe.
 - The board keeps the original per-worktree controls, search, PR links, and live-edit behavior.
 

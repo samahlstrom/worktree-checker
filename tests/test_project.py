@@ -1,6 +1,7 @@
 """Pure project detection tests; commands are inspected and never executed."""
 
 import importlib.util
+import inspect
 from pathlib import Path
 import json
 import tempfile
@@ -22,20 +23,33 @@ class ProjectDetectionTests(unittest.TestCase):
     def test_node_dev_uses_lockfile_and_keeps_script(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self._file(root, "package.json", json.dumps({"scripts": {"dev": "vite dev"}}))
+            self._file(root, "package.json", json.dumps({"scripts": {"dev": "node server.js"}}))
             self._file(root, "pnpm-lock.yaml", "lockfileVersion: 9\n")
             result = project.detect(str(root))
             self.assertEqual(result["kind"], "node")
-            self.assertEqual(result["script"], "vite dev")
+            self.assertEqual(result["script"], "node server.js")
             self.assertEqual(result["argv"][:3], ["pnpm", "run", "dev"])
             self.assertEqual(result["setup"][0][:2], ["pnpm", "install"])
 
-    def test_admin_requires_its_own_script(self):
+    def test_node_detection_has_no_app_specific_mode_or_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self._file(root, "package.json", json.dumps({"scripts": {"dev": "vite"}}))
-            self._file(root, "package-lock.json", "{}")
-            self.assertIsNone(project.detect(str(root), admin=True))
+            self._file(root, "package.json", json.dumps({"scripts": {"dev": "node server.js"}}))
+            result = project.detect(str(root))
+            self.assertEqual(tuple(inspect.signature(project.detect).parameters), ("root",))
+            serialized = json.dumps(result).casefold()
+            for marker in ("admin", "oauth", "firebase", "healthtree", "samson", ":6173", ":3200"):
+                self.assertNotIn(marker, serialized)
+
+    def test_node_uses_standard_dev_script_when_other_scripts_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._file(root, "package.json", json.dumps({
+                "scripts": {"admin:dev": "node private.js", "dev": "node server.js"},
+            }))
+            result = project.detect(str(root))
+            self.assertEqual(result["argv"], ["npm", "run", "dev"])
+            self.assertEqual(result["script"], "node server.js")
 
     def test_node_defaults_to_npm_without_a_lockfile(self):
         with tempfile.TemporaryDirectory() as directory:

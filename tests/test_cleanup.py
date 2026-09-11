@@ -18,13 +18,13 @@ sys.modules[SPEC.name] = cleanup
 SPEC.loader.exec_module(cleanup)
 
 
-REPOSITORY = 'HealthTree/one'
-BRANCH = 'refs/heads/fix/topic'
+REPOSITORY = 'Example/widget'
+BRANCH = 'refs/heads/feature/topic'
 PRIMARY = Path('/repo')
 WORKTREE = Path('/repo/worktree')
 
 
-def merged_pr(number=42, *, repository='one', owner='HealthTree', branch='fix/topic', state='MERGED'):
+def merged_pr(number=42, *, repository='widget', owner='Example', branch='feature/topic', state='MERGED'):
     return {
         'number': number,
         'state': state,
@@ -66,13 +66,13 @@ class CleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / 'config.json'
             config.write_text(json.dumps({'cleanup': {'repositories': {
-                'HealthTree/one': {'path': '/repo', 'webhook_secret': 'secret'},
+                'Example/widget': {'path': '/repo', 'webhook_secret': 'secret'},
             }}}))
             config.chmod(0o600)
             with patch.object(cleanup, 'CONFIG', config):
                 loaded = cleanup.load_config()
-        self.assertEqual(loaded['healthtree/one']['repository'], REPOSITORY)
-        self.assertEqual(loaded['healthtree/one']['path'], PRIMARY)
+        self.assertEqual(loaded['example/widget']['repository'], REPOSITORY)
+        self.assertEqual(loaded['example/widget']['path'], PRIMARY)
 
     def test_newest_exact_repo_and_branch_controls_eligibility(self):
         prs = [merged_pr(42), merged_pr(43, state='OPEN')]
@@ -87,7 +87,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_webhook_requires_signed_same_repository_merged_event(self):
         repositories = {
-            'healthtree/one': {
+            'example/widget': {
                 'repository': REPOSITORY,
                 'path': PRIMARY,
                 'webhook_secret': 'secret',
@@ -100,7 +100,7 @@ class CleanupTests(unittest.TestCase):
         )
         with self.assertRaises(PermissionError):
             cleanup.merged_pr_number('pull_request', body, 'sha256=bad', repositories)
-        fork_body = event_body(head_repository='HealthTree/fork')
+        fork_body = event_body(head_repository='Example/fork')
         self.assertIsNone(cleanup.merged_pr_number(
             'pull_request', fork_body, signature(fork_body), repositories
         ))
@@ -146,7 +146,7 @@ class CleanupTests(unittest.TestCase):
             self.assertFalse(manifest.exists())
             run.assert_not_called()
 
-    def test_retire_stops_pair_rechecks_branch_and_quarantines(self):
+    def test_retire_stops_worktree_rechecks_branch_and_quarantines(self):
         branch = BRANCH
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -155,7 +155,7 @@ class CleanupTests(unittest.TestCase):
             retired = root / 'retired'
             primary.mkdir()
             worktree.mkdir()
-            (worktree / '.git').write_text('gitdir: /tmp/worktree-admin\n')
+            (worktree / '.git').write_text('gitdir: /tmp/worktree-metadata\n')
             calls = []
 
             def git(path, *args, timeout=20):
@@ -163,7 +163,7 @@ class CleanupTests(unittest.TestCase):
                 return branch if args[:2] == ('symbolic-ref', 'HEAD') else ''
 
             class Preview:
-                def stop_pair(self, path):
+                def stop(self, path):
                     calls.append(('stop', path))
                     return {'ok': True}
 

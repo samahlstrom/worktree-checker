@@ -49,7 +49,7 @@ def _package(root):
     return data if isinstance(data, dict) else None
 
 
-def _node(root, admin):
+def _node(root):
     package = _package(root)
     if package is None:
         return None
@@ -57,7 +57,7 @@ def _node(root, admin):
     if not isinstance(scripts, dict):
         return None
     script_name = next(
-        (name for name in (("admin:dev",) if admin else ("dev", "start"))
+        (name for name in ("dev", "start")
          if isinstance(scripts.get(name), str) and scripts[name].strip()),
         None,
     )
@@ -442,7 +442,7 @@ def _rust(root):
     return _result("Rust run", argv, "rust")
 
 
-def detect(root: str, admin=False):
+def detect(root: str):
     """Return a repo-authored preview command, or ``None`` for libraries.
 
     This function only reads repository files. The caller owns cwd, placeholder
@@ -451,10 +451,8 @@ def detect(root: str, admin=False):
     root = _root_path(root)
     if root is None:
         return None
-    if admin:
-        return _node(root, True)
     for detector in (
-        lambda: _node(root, False),
+        lambda: _node(root),
         lambda: _compose(root),
         lambda: _make_or_just(root),
         lambda: _procfile(root),

@@ -19,8 +19,8 @@ loader.exec_module(repositories)
 class RepositoryDiscoveryTests(unittest.TestCase):
     def test_normalize_github_full_name_is_preserved(self):
         self.assertEqual(
-            repositories.normalize_github_full_name("git@github.com:Acme/one.git"),
-            "Acme/one",
+            repositories.normalize_github_full_name("git@github.com:Example/widget.git"),
+            "Example/widget",
         )
 
     def test_linked_worktree_resolves_to_primary_checkout(self):
@@ -40,8 +40,8 @@ class RepositoryDiscoveryTests(unittest.TestCase):
     def test_shallow_discovery_does_not_descend_into_children(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            shallow = home / "Projects" / "one"
-            nested = home / "Projects" / "container" / "two"
+            shallow = home / "Projects" / "widget"
+            nested = home / "Projects" / "container" / "nested-widget"
             (shallow / ".git").mkdir(parents=True)
             (nested / ".git").mkdir(parents=True)
             with patch.object(repositories, "HOME", home):
@@ -52,9 +52,9 @@ class RepositoryDiscoveryTests(unittest.TestCase):
     def test_background_scan_stops_at_a_repo_and_skips_dependency_trees(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            repo = home / "elsewhere" / "one"
-            child_repo = repo / "nested" / "two"
-            ignored = home / "node_modules" / "three"
+            repo = home / "elsewhere" / "widget"
+            child_repo = repo / "nested" / "nested-widget"
+            ignored = home / "node_modules" / "ignored-widget"
             (repo / ".git").mkdir(parents=True)
             (child_repo / ".git").mkdir(parents=True)
             (ignored / ".git").mkdir(parents=True)

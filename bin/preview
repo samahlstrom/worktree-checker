@@ -19,42 +19,24 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
-from worktree_ports import ADMIN_PORT, OAUTH_PORT, RESERVED_PORTS, derive_port
+from worktree_ports import derive_port
 from project import detect
 import worktree_doctor as doctor
 
 GLOBAL_STATE_DIR = os.path.expanduser("~/.local/state/worktree-preview-board")
-OAUTH_REPOS = frozenset({"healthtree/one", "healthtree/next"})
-ADMIN_STATE_SUBDIR = os.path.join(".preview", "admin")
-LOCAL_ADMIN_BOOTSTRAP_PATH = "/__samson-local-admin-bootstrap"
-GUIDE_PREVIEW_PROXY_ENV = "GUIDE_PREVIEW_PROXY_TARGET"
-_ALGOLIA_ENV_KEYS = ("VITE_ALGOLIA_APP_ID", "VITE_ALGOLIA_API_KEY")
-_UNHANDLED_REJECTIONS_WARN = "--unhandled-rejections=warn"
 LOG_TAIL_LINES = 8
 READY_TIMEOUT = 60
-_DEV_SERVER_COMMANDS = frozenset({"node", "nodejs", "npm", "npx", "yarn", "pnpm", "bun", "vite", "next", "next-server", "next-dev"})
-
-def admin_component_path(worktree_path):
-    """Synthetic admin component state for one worktree; never source code."""
-    return os.path.join(os.path.realpath(worktree_path), ADMIN_STATE_SUBDIR)
-
-
-def is_admin_app(path):
-    """True for the synthetic <worktree>/.preview/admin component."""
-    path = os.path.realpath(path)
-    return (os.path.basename(path) == "admin"
-            and os.path.basename(os.path.dirname(path)) == ".preview")
 
 
 def _runtime_root(path):
     """Directory from which this component's dev process must run."""
     path = os.path.realpath(path)
-    return os.path.dirname(os.path.dirname(path)) if is_admin_app(path) else path
+    return path
 
 
 def _preview_dir(path):
     path = os.path.realpath(path)
-    return path if is_admin_app(path) else os.path.join(path, ".preview")
+    return os.path.join(path, ".preview")
 
 
 def worktree_revision(path):
@@ -70,50 +52,8 @@ def worktree_revision(path):
 
 
 def dev_command(path):
-    project = detect(_runtime_root(path), admin=is_admin_app(path))
+    project = detect(_runtime_root(path))
     return (project.get('script') or project['label']) if project else None
-
-
-def _origin_url(path):
-    """This worktree's origin remote URL, or '' if it has none. The subprocess
-    boundary -- stubbed in tests."""
-    r = subprocess.run(
-        ["git", "-C", _runtime_root(path), "remote", "get-url", "origin"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return ""
-    return r.stdout.strip()
-
-
-def is_oauth_bound(path):
-    """True if this worktree belongs to an OAUTH_REPOS app, and so must serve
-    on the shared OAUTH_PORT instead of its own derived port.
-
-    A linked worktree reports the same origin as its primary checkout, so every
-    worktree of one/next answers True -- which is the point: they take turns on
-    the one port Google will accept. Match is anchored on the '/' or ':' before
-    the owner, so a lookalike remote (notheathtree/one) can never pass.
-    """
-    url = _origin_url(path).strip().lower().rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-len(".git")]
-    if not url:
-        return False
-    return any(url.endswith("/" + name) or url.endswith(":" + name)
-               for name in OAUTH_REPOS)
-
-
-def _apply_dev_node_options(env):
-    """Append --unhandled-rejections=warn without clobbering existing NODE_OPTIONS."""
-    existing = (env.get("NODE_OPTIONS") or "").strip()
-    if _UNHANDLED_REJECTIONS_WARN in existing:
-        return env
-    env["NODE_OPTIONS"] = (
-        f"{existing} {_UNHANDLED_REJECTIONS_WARN}".strip() if existing
-        else _UNHANDLED_REJECTIONS_WARN
-    )
-    return env
 
 
 def _parse_dotenv_keys(text, keys):
@@ -154,23 +94,6 @@ def _dotenv_value(val):
     return val
 
 
-def _inject_admin_algolia(env, admin_path):
-    """Put only the root admin's Algolia keys into env; never copy its .env."""
-    env_path = os.path.join(_runtime_root(admin_path), ".env")
-    if not os.path.isfile(env_path):
-        primary = doctor.primary_checkout(_runtime_root(admin_path))
-        env_path = os.path.join(primary, ".env") if primary else ""
-        if not env_path or not os.path.isfile(env_path):
-            return
-    try:
-        with open(env_path, encoding="utf-8") as f:
-            text = f.read()
-    except (OSError, UnicodeError):
-        return
-    for key, val in _parse_dotenv_keys(text, _ALGOLIA_ENV_KEYS).items():
-        env.setdefault(key, val)
-
-
 def _vite_cache_dir(path):
     """Worktree-local Vite cache. Never node_modules/.vite: that follows a
     symlink or APFS clone into another checkout's snapshot."""
@@ -181,47 +104,19 @@ def _vite_overlay_path(path):
     return os.path.join(_preview_dir(path), "vite.config.mjs")
 
 
-def _write_vite_overlay(path, *, local_admin_bootstrap=False):
-    """Tiny Vite config that keeps the app's own config and pins root/cache.
-
-    Vite has no --cacheDir CLI flag (unknown options crash the process).
-    --config replaces the app config unless we merge it back in. A paired
-    local-admin launch also gets one Vite-only route that removes the
-    localhost session collision before the admin SSR layout sees it.
-    """
-    component_path = os.path.realpath(path)
-    root = _runtime_root(component_path)
-    overlay = _vite_overlay_path(component_path)
-    bootstrap = ""
-    plugins = ""
-    if local_admin_bootstrap:
-        bootstrap = (
-            f"const localAdminBootstrapPath = {json.dumps(LOCAL_ADMIN_BOOTSTRAP_PATH)};\n"
-            "const localAdminBootstrapPlugin = {\n"
-            "  name: 'samson-local-admin-bootstrap',\n"
-            "  configureServer(server) {\n"
-            "    server.middlewares.use((req, res, next) => {\n"
-            "      if ((req.url || '').split('?', 1)[0] !== localAdminBootstrapPath) return next();\n"
-            "      res.statusCode = 302;\n"
-            "      res.setHeader('Cache-Control', 'no-store');\n"
-            "      res.setHeader('Set-Cookie', '__session=; Path=/; Max-Age=0; SameSite=Lax');\n"
-            "      res.setHeader('Location', '/');\n"
-            "      res.end();\n"
-            "    });\n"
-            "  },\n"
-            "};\n"
-        )
-        plugins = ", plugins: [localAdminBootstrapPlugin]"
+def _write_vite_overlay(path):
+    """Keep the repo's Vite config and isolate its generated preview cache."""
+    root = _runtime_root(path)
+    overlay = _vite_overlay_path(path)
     os.makedirs(os.path.dirname(overlay), exist_ok=True)
     with open(overlay, "w") as f:
         f.write(
             "import { loadConfigFromFile, mergeConfig } from 'vite';\n"
             f"const root = {json.dumps(root)};\n"
-            f"const cacheDir = {json.dumps(_vite_cache_dir(component_path))};\n"
-            f"{bootstrap}"
+            f"const cacheDir = {json.dumps(_vite_cache_dir(path))};\n"
             "export default async function (env) {\n"
             "  const loaded = await loadConfigFromFile(env, undefined, root);\n"
-            f"  return mergeConfig(loaded?.config ?? {{}}, {{ root, cacheDir{plugins} }});\n"
+            "  return mergeConfig(loaded?.config ?? {}, { root, cacheDir });\n"
             "}\n"
         )
     return overlay
@@ -253,27 +148,14 @@ def _build_argv_env(dev, port, *, loopback_host=None, path=None, vite_config=Non
                     defaults.update(_parse_dotenv_keys(text, keys))
         for key, value in defaults.items():
             env.setdefault(key, value)
-    env["PORT"] = str(port)  # next's scripts/dev.js reads this directly
+    env["PORT"] = str(port)
     runtime_root = _runtime_root(path) if path else None
     if runtime_root:
         # Popen cwd= chdir's the child but leaves inherited $PWD (the board
-        # process was started from Sam's one primary). Tools that read PWD
+        # process was started from another checkout). Tools that read PWD
         # would then resolve that other checkout.
         env["PWD"] = runtime_root
-    _apply_dev_node_options(env)
-    if port == ADMIN_PORT:
-        # Without this the admin proxies guide-preview grants to vite's default
-        # 5173, which is not where the main app runs, and the grant silently
-        # reaches nothing.
-        env.setdefault(GUIDE_PREVIEW_PROXY_ENV, f"http://localhost:{OAUTH_PORT}")
-        # Board serves One on OAUTH_PORT (6173), never vite's 5173. Force the
-        # impersonation handoff target so a stale root .env cannot send
-        # "Log in as user" at a server that is not running. process.env wins
-        # over loadEnv in the admin Vite config.
-        env["VITE_FRONTEND_URL"] = f"http://localhost:{OAUTH_PORT}"
-        if path:
-            _inject_admin_algolia(env, path)
-    project = detect(runtime_root, admin=is_admin_app(path))
+    project = detect(runtime_root)
     argv = [arg.replace('{root}', runtime_root).replace('{port}', str(port)) for arg in project['argv']]
     if project["kind"] == "node" and "vite" in dev:
         # vite itself ignores $PORT; needs the flag passed through npm's --
@@ -323,7 +205,7 @@ def _ensure_ignored(path):
 
 
 def _log_tail(path, max_lines=LOG_TAIL_LINES):
-    """Last non-empty lines of .preview/log -- the Firebase / node stack that
+    """Last non-empty lines of .preview/log -- the process output that
     explains why the process died. Best-effort; empty string if missing."""
     log_path = os.path.join(_preview_dir(path), "log")
     try:
@@ -411,7 +293,7 @@ def _terminate(processes, *, owned_group=False):
         return
     known = {p['pid']: p for p in processes}
     initial = _processes()
-    # Include children of an external Node listener, never its shell/parent.
+    # Include children of an managed listener, never its shell/parent.
     while True:
         children = {pid: p for pid, p in initial.items() if p['parent'] in known}
         if children.keys() <= known.keys():
@@ -439,7 +321,7 @@ def _terminate(processes, *, owned_group=False):
 
 
 def port_is_ready(port, vite=False):
-    # Vite's own client avoids compiling SSR and contacting Firebase just to
+    # Vite's own client avoids rendering application pages just to
     # check whether the dev server started. Browser navigation loads the page.
     route = '/@vite/client' if vite else '/'
     try:
@@ -530,35 +412,12 @@ def _stop(state, paths):
         raise RuntimeError('; '.join(errors))
 
 
-def _port_holders(ports):
-    """Inspect every requested port before touching the current preview."""
-    holders = {}
-    for port in ports:
-        listeners = _listeners(port)
-        processes = _processes()
-        owners = [processes.get(pid) for pid in listeners]
-        if any(p is None or os.path.basename(p['command']).split()[0] not in _DEV_SERVER_COMMANDS
-               for p in owners):
-            raise RuntimeError(f'Port {port} is held by a process that is not a dev server.')
-        holders[port] = owners
-    return holders
-
-
-def _free_ports(state, ports, holders):
-    held = [path for path, record in state.items() if record.get('port') in ports]
-    _stop(state, held)
-    for port in ports:
-        _terminate(holders[port])
-        if _listeners(port):
-            raise RuntimeError(f'Port {port} is still occupied. Its owner may be restarting it.')
-
-
 def _launch(state, path, port):
     dev = dev_command(path)
     os.makedirs(_preview_dir(path), exist_ok=True)
     _ensure_ignored(path)
-    project = detect(_runtime_root(path), admin=is_admin_app(path))
-    overlay = _write_vite_overlay(path, local_admin_bootstrap=is_admin_app(path)) if project['kind'] == 'node' and 'vite' in dev else None
+    project = detect(_runtime_root(path))
+    overlay = _write_vite_overlay(path) if project['kind'] == 'node' and 'vite' in dev else None
     argv, env = _build_argv_env(dev, port, loopback_host='localhost', path=path, vite_config=overlay)
     with open(os.path.join(_preview_dir(path), 'log'), 'wb') as log:
         child = subprocess.Popen(argv, cwd=_runtime_root(path), env=env, stdout=log,
@@ -620,13 +479,7 @@ def _wait_ready(state, path, deadline):
 
 
 def _result(state, paths, already=False):
-    components = [dict(ok=True, ready=True, port=state[p]['port'], already_running=already)
-                  for p in paths]
-    if len(paths) == 1:
-        return components[0]
-    admin, main = components
-    return dict(ok=True, ready=True, port=main['port'], admin_port=admin['port'],
-                main=main, admin=admin, already_running=already)
+    return dict(ok=True, ready=True, port=state[paths[0]]['port'], already_running=already)
 
 
 def _run_setup(argv, root, log_dir):
@@ -658,18 +511,14 @@ def _start(state, paths, *, restart=False):
                            and port_is_ready(state[p]['port'], vite='vite' in dev_command(p)) for p in paths):
         return _result(state, paths, already=True)
 
-    doctor.prepare(_runtime_root(paths[-1]), detect(_runtime_root(paths[-1]), admin=is_admin_app(paths[-1])), _run_setup)
-    pair = len(paths) == 2
-    ports = [ADMIN_PORT, OAUTH_PORT] if pair else [
-        ADMIN_PORT if is_admin_app(paths[0]) else OAUTH_PORT if is_oauth_bound(paths[0]) else derive_port(paths[0])]
-    if not pair and ports[0] not in RESERVED_PORTS:
-        while _listeners(ports[0]) and not any(r.get('port') == ports[0] for r in state.values()):
-            ports[0] += 1
-            while ports[0] in RESERVED_PORTS:
-                ports[0] += 1
-    holders = _port_holders(ports)
+    doctor.prepare(_runtime_root(paths[-1]), detect(_runtime_root(paths[-1])), _run_setup)
     _stop(state, paths)
-    _free_ports(state, ports, holders)
+    ports = []
+    for path in paths:
+        port = derive_port(path)
+        while _listeners(port) or port in ports:
+            port += 1
+        ports.append(port)
     deadline = time.monotonic() + READY_TIMEOUT
     path = paths[0]
     try:
@@ -683,19 +532,19 @@ def _start(state, paths, *, restart=False):
         state[path] = dict(port=ports[paths.index(path)], error=str(error))
         _save_state(state)
         return dict(ok=False, error='start_failed', message=str(error), log_tail=tail,
-                    component='admin' if is_admin_app(path) else 'main', port=state[path]['port'])
+                    port=state[path]['port'])
 
 
-def _operate(path, action, pair=False, expected_revision=None):
+def _operate(path, action, expected_revision=None):
     path = os.path.realpath(path)
-    paths = [admin_component_path(path), path] if pair else [path]
+    paths = [path]
     try:
         with _transition() as state:
             if action == 'stop':
                 _stop(state, paths)
                 return dict(ok=True, stopped=True)
             if expected_revision is not None:
-                # A stale watcher must never take the slot back from Sam's new choice.
+                # A stale watcher must never take the slot back from a newer preview.
                 if (not all(state.get(p) and _members(state[p], _processes()) for p in paths)
                         or worktree_revision(path) != expected_revision):
                     return dict(ok=True, skipped=True)
@@ -704,7 +553,7 @@ def _operate(path, action, pair=False, expected_revision=None):
         return dict(ok=False, error='preview_failed', message=str(error), log_tail=_log_tail(path))
 
 
-def start(path, force=False):
+def start(path):
     return _operate(path, 'start')
 
 
@@ -712,21 +561,13 @@ def stop(path):
     return _operate(path, 'stop')
 
 
-def start_pair(path, force=False):
-    return _operate(path, 'start', pair=True)
-
-
-def stop_pair(path):
-    return _operate(path, 'stop', pair=True)
-
-
-def restart(path, pair=False, expected_revision=None):
-    return _operate(path, 'restart', pair=pair, expected_revision=expected_revision)
+def restart(path, expected_revision=None):
+    return _operate(path, 'restart', expected_revision=expected_revision)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('start', 'stop', 'status', 'start-pair', 'stop-pair'))
+    parser.add_argument('action', choices=('start', 'stop', 'status'))
     parser.add_argument('path', nargs='?', default=os.getcwd())
     args = parser.parse_args()
     action = globals()[args.action.replace('-', '_')]

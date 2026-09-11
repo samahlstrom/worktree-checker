@@ -66,7 +66,7 @@ def repair_local_files(root):
                                      capture_output=True, timeout=5)
             if ignored.returncode == 0:
                 shutil.copy2(source, target)
-    for name in ('.svelte-kit', '.svelte-kit-admin'):
+    for name in ('.svelte-kit',):
         generated = root / name
         if generated.is_symlink() and root not in generated.resolve().parents:
             generated.unlink()

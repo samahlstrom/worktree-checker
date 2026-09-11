@@ -23,7 +23,7 @@ class DoctorTests(unittest.TestCase):
     def test_missing_packages_use_the_detected_manager(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'package.json').write_text(json.dumps({'scripts': {'dev': 'vite'}, 'dependencies': {'vite': '*'}, 'packageManager': 'pnpm@10.0.0'}))
+            (root / 'package.json').write_text(json.dumps({'scripts': {'dev': 'node server.js'}, 'dependencies': {'some-package': '*'}, 'packageManager': 'pnpm@10.0.0'}))
             run = Mock()
             with patch.object(doctor, 'health', side_effect=[{'ok': False}, {'ok': True}]):
                 doctor.prepare(root, project.detect(root), run)
@@ -32,7 +32,7 @@ class DoctorTests(unittest.TestCase):
     def test_timeout_is_reported_as_unhealthy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'package.json').write_text('{"dependencies":{"vite":"*"}}')
+            (root / 'package.json').write_text('{"dependencies":{"some-package":"*"}}')
             (root / 'node_modules').mkdir()
             with patch.object(doctor.subprocess, 'run', side_effect=subprocess.TimeoutExpired('npm', 30)):
                 self.assertFalse(doctor.health(root)['ok'])

@@ -46,7 +46,7 @@ The match requires the exact repository and exact PR head branch. The newest PR
 for that branch wins, so do not reuse a branch for a new delivery after its old
 PR merges. The primary checkout is never retired.
 
-Before retirement, Worktree Checker stops the board's preview pair, stops
+Before retirement, Worktree Checker stops the board's preview, stops
 same-user processes whose current directory is the worktree (and their
 descendants), and checks each process identity again before sending a signal.
 Dirty files and active processes do not protect a merged linked worktree; enable
@@ -85,7 +85,7 @@ Only signed `pull_request` events with action `closed`, `merged: true`, and a
 same-repository head wake the worker. Fork PRs and all other events are ignored.
 The periodic GitHub scan remains the recovery path for missed webhooks.
 
-The cleanup service does not require Herdr, Samson, or any agent harness.
+The cleanup service does not require an agent harness.
 GitHub webhooks are the only event hook; the service does not run arbitrary
 shell hooks. Quarantine removal runs in a separate low-priority worker, one
 entry at a time, so a slow removal does not hold up repository scans.
